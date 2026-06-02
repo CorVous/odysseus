@@ -44,6 +44,12 @@ ALWAYS_AVAILABLE = frozenset({
     "update_plan",
 })
 
+# The document WRITE tools. manage_documents (read/list) is force-included
+# alongside these so the model is never able to edit a doc but not read one.
+_DOC_WRITE_TOOLS = frozenset({
+    "create_document", "edit_document", "update_document", "suggest_document",
+})
+
 # Tools that the Personal Assistant always has access to during scheduled
 # check-ins and proactive tasks, in addition to RAG-selected tools.
 ASSISTANT_ALWAYS_AVAILABLE = frozenset({
@@ -418,7 +424,12 @@ class ToolIndex:
                    "open the", "open my", "open document", "open doc", "find the",
                    "find my", "find document", "read the", "read my", "show me the",
                    "show my", "the file", "my file", "the report", "the write-up",
-                   "the writeup", "saved document", "in my library", "in the library"}):
+                   "the writeup", "saved document", "in my library", "in the library",
+                   # generic "view/read the contents" phrasings that miss the
+                   # specific verbs above (e.g. "view the project outline").
+                   "the document", "this document", "the doc", "view document",
+                   "view the doc", "view the document", "contents of", "what's in",
+                   "what does it say", "the outline", "the contents"}):
             {"manage_documents", "edit_document"},
         # Theme / UI control intent
         frozenset({"theme", "color scheme", "colors of the ui", "make it dark",
@@ -502,6 +513,14 @@ class ToolIndex:
         # prompts do not drag web schemas into the agent context.
         if self._WEB_RE.search(query):
             base.update({"web_search", "web_fetch"})
+        # Co-occurrence: manage_documents (read/list a doc) is the sibling of the
+        # document WRITE tools. RAG retrieval + the top-k budget routinely surface
+        # the writers but evict the reader, leaving the model able to EDIT a doc
+        # but unable to READ one — so "show me / what's in the document" fails
+        # because the only tool that returns content was never offered. Whenever
+        # any document writer is in play, include the reader too.
+        if base & _DOC_WRITE_TOOLS:
+            base.add("manage_documents")
         return base
 
 
