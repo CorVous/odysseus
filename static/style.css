@@ -35397,10 +35397,10 @@ body.theme-frosted .modal {
      stays zoom-safe AND visibly larger than medium (otherwise L collapses
      onto M on touch). All three editor layers move together so the
      highlight/line-number overlay stays metrically aligned with the textarea. */
-  .doc-font-m .doc-editor-textarea, .doc-font-m .doc-editor-highlight, .doc-font-m .doc-line-numbers {
+  .doc-font-m .doc-editor-textarea, #doc-editor-textarea, .doc-font-m .doc-editor-highlight, .doc-font-m .doc-line-numbers {
     font-size: 16px !important;   /* was 13px */
   }
-  .doc-font-l .doc-editor-textarea, .doc-font-l .doc-editor-highlight, .doc-font-l .doc-line-numbers {
+  .doc-font-l .doc-editor-textarea, #doc-editor-textarea, .doc-font-l .doc-editor-highlight, .doc-font-l .doc-line-numbers {
     font-size: 18px !important;   /* was 15px — keep L > M */
   }
   /* Email compose rich-body. Medium (15px) zooms, so bump it; large (17px)
