@@ -1245,6 +1245,18 @@ _VERIFIER_EFFECTFUL_TOOLS = {
     "bash", "python", "write_file",
 }
 _VERIFIER_MAX_ROUNDS = 2  # cap re-verify cycles per turn — never loop forever
+_MAX_INTENT_NUDGES = 1  # cap "announced an action but emitted no tool call" re-prompts per turn
+# Forward-looking first-person phrasing signalling the model intends to act
+# NEXT — used to catch a "preamble" round that emitted no tool call and would
+# otherwise be misread as a finished answer.
+# Deliberately excludes "let me" / "let's": they dominate legitimate closings
+# ("let me know if you need anything") far more than real preambles, so they
+# caused false nudges on finished turns.
+_INTENT_RE = re.compile(
+    r"\b(i'?ll|i will|i'?m going to|i am going to|"
+    r"next[, ]+i|now i'?ll|i'?ll now|first[, ]+i|then i'?ll)\b",
+    re.IGNORECASE,
+)
 
 
 def _build_actions_snapshot(tool_events: list, limit: int = 8000) -> str:
@@ -1573,6 +1585,7 @@ async def stream_agent_loop(
     # on such turns and at most _VERIFIER_MAX_ROUNDS times.
     _effectful_used = False
     _verifier_rounds = 0
+    _intent_nudges = 0  # trailed-off-intent guard: re-prompts used this turn
     _verifier_instruction = _extract_last_user_message(messages)
     real_input_tokens = 0   # Accumulated real usage from API
     real_output_tokens = 0
@@ -1937,6 +1950,50 @@ async def stream_agent_loop(
                     # never re-verify an unchanged state in a loop.
                     _effectful_used = False
                     continue
+
+            # ── Trailed-off-intent guard ──────────────────────────────
+            # `not tool_blocks` lumps two cases together: a genuine final
+            # answer, and a "preamble" round where the model ANNOUNCED a
+            # next action ("I'll read the remaining files at once:") but
+            # emitted no call — common on local models (incl. Qwen MoE).
+            # The bare `break` below accepts both as "done", so a preamble
+            # silently ends the turn mid-task. Detect the preamble and run
+            # ONE more round (tools still available) so the model can
+            # actually make the call. Capped; skipped on force-answer
+            # rounds, where we deliberately want it to stop calling tools.
+            _intent_text = _THINK_RE.sub("", cleaned_round).strip()
+            _intent_tail = _intent_text[-200:]
+            # High-precision triggers ONLY: a dangling colon (classic
+            # "I'll do X:" with the action never emitted), or explicit
+            # forward-looking phrasing in a sentence that isn't closed off.
+            # Intentionally NO "short answer without a period" rule — that
+            # nudged legitimate one-line final answers ("Done", "Yes, 42").
+            # An empty round falls through to break (empty-response fallback).
+            _looks_unfinished = bool(_intent_text) and (
+                _intent_text.endswith(":")
+                or (_INTENT_RE.search(_intent_tail)
+                    and not _intent_text.endswith((".", "!", "?", "`", ")", '"', "'", "”")))
+            )
+            if (_looks_unfinished and not _force_answer
+                    and _intent_nudges < _MAX_INTENT_NUDGES):
+                _intent_nudges += 1
+                logger.info(
+                    f"[agent] trailed-off intent on round {round_num}: no tool "
+                    f"call after an action preamble; nudging once. "
+                    f"tail={_intent_tail[-80:]!r}"
+                )
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your last message described a next action but included no "
+                        "tool call. If that step is still needed, make the tool call "
+                        "now. If the task is already complete, just stop — a plain "
+                        "final answer with no tool call is perfectly fine and you do "
+                        "not need to take any further action."
+                    ),
+                })
+                continue
             break  # no tools — done
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
