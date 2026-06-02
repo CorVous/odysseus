@@ -15,6 +15,7 @@ import logging
 import os
 import pathlib
 import re
+import signal
 import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -212,6 +213,39 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
             raise ValueError(f"path '{raw_path}' is outside the workspace ({workspace})")
     return resolved
 
+# Bash + python tools used to share a single 60s timeout. That's
+# enough for one-shot commands but starves real workloads (pip
+# install, ffmpeg conversions, etc.) — and worse, the agent saw the
+# 60s timeout and went silent because it had nothing to report.
+# The new default is intentionally generous: long enough that real
+# work isn't killed mid-flight, but bounded so a runaway process
+# (infinite loop, hung connect, etc.) eventually frees the worker.
+# The user can cancel sooner via the chat stop button — when the
+# SSE stream is torn down, the asyncio task running the subprocess
+# gets cancelled and the subprocess is killed by the finally block.
+# Foreground tool calls must NOT block the agent turn indefinitely: a runaway
+# command (a dev server, a `--watch` build, an accidental REPL) would otherwise
+# wedge the whole conversation. These are generous enough for normal slow-but-
+# finite jobs (installs, builds, test suites); genuinely long jobs are expected
+# to use the `#!bg` marker. Both are overridable at runtime via the
+# `bash_timeout_seconds` / `python_timeout_seconds` settings (clamped to >=5s).
+DEFAULT_BASH_TIMEOUT = 600          # 10 min
+DEFAULT_PYTHON_TIMEOUT = 600        # 10 min
+# Foreground bash that produces NO output for this long is killed early as a
+# likely server/blocking command — shrinks the worst-case wedge from the full
+# wall-clock timeout to ~this for commands the name-based classifier misses
+# (custom scripts, etc.). Generous to avoid killing a legitimately-silent build
+# (pip dep resolution, etc.); set to 0 to disable. Override via setting.
+DEFAULT_BASH_IDLE_KILL = 120        # 2 min of total silence
+
+# How often to push a progress event while a long-running subprocess
+# is still in flight. The frontend cares about "alive" more than
+# "every-byte" — 2s is the sweet spot.
+PROGRESS_INTERVAL_S = 2.0
+# Tail buffer size — we keep the most recent N lines of stdout +
+# stderr so the progress event includes a "what's it doing right now"
+# snippet without dragging the whole output along.
+PROGRESS_TAIL_LINES = 12
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +323,179 @@ def _resolve_search_root(raw_path: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+
+def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill the subprocess AND all its descendants.
+
+    Subprocesses are spawned with start_new_session=True, making `proc` a
+    process-group leader, so signalling the group (negative pgid) reaps the
+    grandchildren too — e.g. the `node`/`webpack` a `/bin/sh -c 'npm start'`
+    forks. A bare proc.kill() only kills the shell, leaving the real workers
+    running orphaned and still holding the output pipe open. Falls back to
+    proc.kill() where process groups aren't available (Windows)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        return
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _tool_timeout(setting_key: str, default: int) -> int:
+    """Resolve a foreground tool timeout from settings, clamped to a 5s floor
+    so a misconfigured 0/negative/blank value can't make every command time
+    out instantly. Falls back to `default` on any error."""
+    try:
+        from src.settings import get_setting as _gs
+        return max(5, int(_gs(setting_key, default) or default))
+    except Exception:
+        return default
+
+
+def _tool_idle(setting_key: str, default: int) -> int:
+    """Resolve the idle-kill window from settings. 0 (or negative) DISABLES the
+    idle check; positive values are clamped to a 10s floor. Falls back to
+    `default` on any error."""
+    try:
+        from src.settings import get_setting as _gs
+        v = int(_gs(setting_key, default))
+        return max(10, v) if v > 0 else 0
+    except Exception:
+        return default
+
+
+async def _run_subprocess_streaming(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    idle_timeout: float = 0,
+) -> Tuple[str, str, Optional[int], bool, str]:
+    """Run a subprocess to completion, streaming progress.
+
+    Reads stdout + stderr line-by-line into ring buffers so a
+    periodic progress callback can emit a "tail" of recent output
+    without waiting for the full result. Returns
+    (full_stdout, full_stderr, return_code, timed_out, kill_reason).
+
+    `timed_out=True` means the process was killed. `kill_reason` is
+    "wallclock" (ran past `timeout`s) or "idle" (produced no output for
+    `idle_timeout`s — a likely server/blocking command). When
+    `idle_timeout` is 0 the idle check is disabled. Whatever output we'd
+    buffered up to the kill is still returned.
+    """
+    started = time.time()
+    last_output = [started]   # mutable: updated by readers on each line
+    stdout_full: list[str] = []
+    stderr_full: list[str] = []
+    tail = collections.deque(maxlen=PROGRESS_TAIL_LINES)
+
+    async def _reader(stream, full_buf, label: str):
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            last_output[0] = time.time()
+            decoded = line.decode("utf-8", errors="replace").rstrip("\n")
+            full_buf.append(decoded)
+            if label == "err":
+                tail.append(f"! {decoded}")
+            else:
+                tail.append(decoded)
+
+    async def _progress_emitter():
+        # Skip the first push — many commands finish well under
+        # PROGRESS_INTERVAL_S and a 0-second "progress" event would
+        # just add UI churn.
+        await asyncio.sleep(PROGRESS_INTERVAL_S)
+        while True:
+            if progress_cb:
+                try:
+                    await progress_cb({
+                        "elapsed_s": round(time.time() - started, 1),
+                        "tail": "\n".join(list(tail)),
+                    })
+                except Exception:
+                    # Progress is best-effort — never let a UI hiccup
+                    # break the underlying subprocess.
+                    pass
+            await asyncio.sleep(PROGRESS_INTERVAL_S)
+
+    rd_out = asyncio.create_task(_reader(proc.stdout, stdout_full, "out"))
+    rd_err = asyncio.create_task(_reader(proc.stderr, stderr_full, "err"))
+    prog_task = asyncio.create_task(_progress_emitter()) if progress_cb else None
+
+    timed_out = False
+    kill_reason = ""
+    try:
+        while True:
+            elapsed = time.time() - started
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                timed_out, kill_reason = True, "wallclock"
+                _kill_proc_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
+                break
+            # Poll in short steps so we can enforce the idle deadline; when idle
+            # checking is off, just wait out the remaining wall-clock in one go.
+            step = min(remaining, 2.0) if idle_timeout else remaining
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=step)
+                break  # process exited on its own
+            except asyncio.TimeoutError:
+                if idle_timeout and (time.time() - last_output[0]) >= idle_timeout:
+                    timed_out, kill_reason = True, "idle"
+                    _kill_proc_tree(proc)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2)
+                    except Exception:
+                        pass
+                    break
+                continue
+    except asyncio.CancelledError:
+        # User hit stop / SSE stream torn down. Kill the child so it
+        # doesn't keep running orphaned. Re-raise so the agent loop's
+        # cancellation propagates as the user expects.
+        _kill_proc_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            pass
+        # Best-effort: stop the readers + emitter before re-raising.
+        for t in (rd_out, rd_err):
+            t.cancel()
+        if prog_task is not None:
+            prog_task.cancel()
+        raise
+    finally:
+        if prog_task is not None and not prog_task.done():
+            prog_task.cancel()
+            try:
+                await prog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Wait for readers to finish draining the pipes.
+        for t in (rd_out, rd_err):
+            try:
+                await asyncio.wait_for(t, timeout=1)
+            except Exception:
+                pass
+
+    return (
+        "\n".join(stdout_full),
+        "\n".join(stderr_full),
+        proc.returncode,
+        timed_out,
+        kill_reason,
+    )
 
 _ADMIN_TOOLS = {
     "app_api",
@@ -493,6 +700,80 @@ async def _direct_fallback(
         from src.agent_tools import TOOL_HANDLERS
         if tool in TOOL_HANDLERS:
             return await TOOL_HANDLERS[tool](content, ctx)
+        if tool == "bash":
+            # start_new_session=True makes the shell a process-group leader so
+            # _kill_proc_tree can reap any children (npm/node/webpack/etc.) on
+            # timeout or cancellation — a bare kill would orphan them.
+            proc = await asyncio.create_subprocess_shell(
+                content,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_subproc_env,
+                cwd=workspace or _AGENT_WORKDIR,
+                start_new_session=True,
+            )
+            _bash_timeout = _tool_timeout("bash_timeout_seconds", DEFAULT_BASH_TIMEOUT)
+            _bash_idle = _tool_idle("bash_idle_kill_seconds", DEFAULT_BASH_IDLE_KILL)
+            stdout, stderr, rc, timed_out, kill_reason = await _run_subprocess_streaming(
+                proc,
+                timeout=_bash_timeout,
+                progress_cb=progress_cb,
+                idle_timeout=_bash_idle,
+            )
+            if timed_out:
+                if kill_reason == "idle":
+                    _msg = (f"bash: produced no output for {_bash_idle}s and was killed "
+                            f"(with its child processes). This usually means a server, watcher, "
+                            f"or interactive program that never exits. If you meant to start a "
+                            f"long-running process, re-run it with `#!bg` as the very first line "
+                            f"so it runs in the background instead of blocking the turn.")
+                else:
+                    _msg = (f"bash: timed out after {_bash_timeout}s and was killed "
+                            f"(including any child processes). If this is a long-running "
+                            f"job — a build, install, server, or --watch process — re-run it "
+                            f"with `#!bg` as the very first line so it runs in the background "
+                            f"and returns a job id immediately instead of blocking.")
+                return {"error": _msg, "exit_code": 124,
+                        "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
+            output = stdout.rstrip()
+            err = stderr.rstrip()
+            if err:
+                output = (output + "\nSTDERR: " + err).strip() if output else "STDERR: " + err
+            output = _truncate(output, MAX_OUTPUT_CHARS)
+            return {"output": output or "(no output)", "exit_code": rc or 0}
+
+        if tool == "python":
+            # Run user code in a subprocess so an infinite loop or crash
+            # can't take the whole server down. -I = isolated mode (skip
+            # user site, no PYTHONPATH inheritance) for hygiene.
+            proc = await asyncio.create_subprocess_exec(
+                # Use the running interpreter — there is no `python3.exe` on
+                # Windows, which made the agent's `python` tool fail there.
+                (sys.executable or "python"), "-I", "-c", content,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_subproc_env,
+                cwd=workspace or _AGENT_WORKDIR,
+                start_new_session=True,
+            )
+            _py_timeout = _tool_timeout("python_timeout_seconds", DEFAULT_PYTHON_TIMEOUT)
+            stdout, stderr, rc, timed_out, kill_reason = await _run_subprocess_streaming(
+                proc,
+                timeout=_py_timeout,
+                progress_cb=progress_cb,
+            )
+            if timed_out:
+                return {"error": (f"python: timed out after {_py_timeout}s and was killed "
+                                  f"(including any child processes). For a long-running job, "
+                                  f"start it with `#!bg` as the first line so it runs in the "
+                                  f"background instead of blocking."),
+                        "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
+            output = stdout.rstrip()
+            err = stderr.rstrip()
+            if err:
+                output = (output + "\nSTDERR: " + err).strip() if output else "STDERR: " + err
+            output = _truncate(output, MAX_OUTPUT_CHARS)
+            return {"output": output or "(no output)", "exit_code": rc or 0}
 
     except Exception as e:
         return {"error": f"{tool}: {e}", "exit_code": 1}
@@ -747,6 +1028,28 @@ async def _execute_tool_block_impl(
                 "bg_job_id": rec["id"],
             }
             logger.info(f"Tool executed: {desc} -> bg job {rec['id']}")
+            return desc, result
+        # Foreground bash: refuse a command that will not terminate on its own
+        # (dev server, --watch, tail -f, REPL). Running it foreground would wedge
+        # the whole turn; tell the model to use #!bg instead. Conservative,
+        # HIGH-confidence name-based signatures only (see src/cmd_classify.py).
+        from src.cmd_classify import classify as _classify_cmd
+        _verdict = _classify_cmd(content)
+        if _verdict.non_terminating:
+            _short = content.strip().split(chr(10))[0][:80]
+            desc = f"bash (refused, non-terminating): {_short}"
+            result = {
+                "error": (
+                    f"Refused to run this in the foreground: {_verdict.reason}. A command "
+                    f"that does not exit on its own would block the entire turn. Re-run it "
+                    f"with `#!bg` as the very first line to launch it in the background "
+                    f"(you get a job id immediately and are re-invoked with its output), "
+                    f"or, if you only need a snapshot, give it a terminating bound "
+                    f"(a `timeout`, `-c`/`--count`, or pipe to `head`)."
+                ),
+                "exit_code": 1,
+            }
+            logger.info(f"Tool refused (non-terminating foreground): {_short!r} — {_verdict.reason}")
             return desc, result
 
     # Route MCP-extracted tools through the MCP manager. Forward

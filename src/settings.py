@@ -127,6 +127,17 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Wall-clock caps (seconds) for FOREGROUND bash/python tool calls. A
+    # runaway/non-terminating command (dev server, --watch build) is killed —
+    # along with its whole process tree — after this long. Long-but-finite
+    # jobs should use the `#!bg` marker instead of a bigger cap. Clamped to a
+    # 5s floor; the model is told to retry with `#!bg` on timeout.
+    "bash_timeout_seconds": 600,
+    "python_timeout_seconds": 600,
+    # Kill a foreground bash command that emits NO output for this many seconds
+    # (likely a server/blocking command the name-based classifier didn't catch).
+    # 0 disables; positive values are clamped to a 10s floor.
+    "bash_idle_kill_seconds": 120,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
