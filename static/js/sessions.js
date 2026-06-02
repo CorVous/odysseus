@@ -2156,6 +2156,15 @@ async function _checkServerStream(sessionId) {
     // Skip if this is a research stream — research has its own progress UI
     if (info.mode === 'research' || info.is_research) return;
 
+    // Prefer reattaching to the live replay stream so the user sees the
+    // in-progress tools + generated text (via /api/chat/resume), not just a
+    // spinner. Falls through to the spinner+poll below if resume can't start.
+    if (window.chatModule && window.chatModule.resumeStream) {
+      try {
+        if (await window.chatModule.resumeStream(sessionId)) return;
+      } catch (_) { /* fall through to spinner+poll */ }
+    }
+
     // Server is still streaming — show spinner and poll
     const box = document.getElementById('chat-history');
     if (!box) return;

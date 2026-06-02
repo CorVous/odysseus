@@ -7,7 +7,10 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v326';
+// v327: force re-precache so clients pick up the updated chat.js + sessions.js
+// (resume-stream-on-reload fix) — the unversioned sessions.js was being served
+// stale from an older SW cache.
+const CACHE_NAME = 'odysseus-v327';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags

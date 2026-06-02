@@ -3106,6 +3106,120 @@ import createResearchSynapse from './researchSynapse.js';
     }
   }
 
+  /**
+   * Reattach to an in-progress server run after a FULL PAGE RELOAD.
+   * The in-page background-stream machinery (detach/checkBackgroundStream)
+   * is lost on refresh, so without this the user only sees a bare spinner.
+   * The backend tees every run's SSE events into a replay buffer
+   * (src/agent_runs.py); GET /api/chat/resume/<id> replays the backlog
+   * (tools + text emitted so far) then streams live. We render the text and
+   * a tool-activity indicator as they arrive, then reload the session so the
+   * canonical final view (proper tool bubbles, metrics) lands.
+   * Returns true if a resume stream was started; false to let the caller
+   * fall back to its spinner+poll.
+   */
+  async function resumeStream(sessionId) {
+    if (!sessionId) return false;
+    if (hasActiveStream(sessionId)) return true; // foreground/background already handles it
+    let res;
+    try {
+      res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`, { credentials: 'same-origin' });
+    } catch (_) {
+      return false;
+    }
+    if (!res.ok || !res.body) return false;
+
+    const box = document.getElementById('chat-history');
+    if (!box) return false;
+
+    const meta = sessionModule.getSessions().find((s) => s.id === sessionId);
+    const roleLabel = _shortModel(meta && meta.model);
+    const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const holder = document.createElement('div');
+    holder.className = 'msg msg-ai';
+    holder.innerHTML = '<div class="role">' + roleLabel + ' <span class="role-timestamp">' + roleTs +
+      '</span></div><div class="body"></div>' +
+      '<div class="resume-tool" style="opacity:.65;font-size:.85em;margin-top:4px;"></div>';
+    _applyModelColor(holder.querySelector('.role'), meta && meta.model);
+    const bodyDiv = holder.querySelector('.body');
+    const toolDiv = holder.querySelector('.resume-tool');
+    const spinner = spinnerModule.create('Reconnecting to in-progress response…', 'right');
+    bodyDiv.appendChild(spinner.createElement());
+    spinner.start();
+    box.appendChild(holder);
+    uiModule.scrollHistory();
+
+    _streamSessionId = sessionId;            // make hasActiveStream() report active
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let accumulated = '';
+    let thinkOpen = false;
+    let spinnerGone = false;
+
+    const killSpinner = () => { if (!spinnerGone) { try { spinner.destroy(); } catch (_) {} spinnerGone = true; } };
+    const renderBody = () => {
+      killSpinner();
+      bodyDiv.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(accumulated));
+      if (window.hljs) bodyDiv.querySelectorAll('pre code').forEach((b) => window.hljs.highlightElement(b));
+      uiModule.scrollHistory();
+    };
+
+    let done = false;
+    try {
+      while (!done) {
+        // User navigated away — stop rendering into this (now hidden) view.
+        if (sessionModule.getCurrentSessionId() !== sessionId) { try { reader.cancel(); } catch (_) {} break; }
+        const { value, done: rdone } = await reader.read();
+        if (rdone) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') { done = true; break; }
+          let json;
+          try { json = JSON.parse(data); } catch (_) { continue; }
+          if (json.delta) {
+            let d = json.delta;
+            if (json.thinking) { if (!thinkOpen) { d = '<think>' + d; thinkOpen = true; } }
+            else if (thinkOpen) { d = '</think>' + d; thinkOpen = false; }
+            accumulated += d;
+            renderBody();
+          } else if (json.type === 'tool_start') {
+            killSpinner();
+            const t = json.tool || 'tool';
+            const c = (json.command || '').split('\n')[0].slice(0, 80);
+            toolDiv.textContent = '⚙ ' + t + (c ? ': ' + c : '') + ' …';
+          } else if (json.type === 'tool_progress') {
+            if (json.elapsed_s != null && toolDiv.textContent) {
+              toolDiv.textContent = toolDiv.textContent.replace(/ \(\d+s\)$/, '') + ' (' + Math.round(json.elapsed_s) + 's)';
+            }
+          } else if (json.type === 'doc_stream_open' && documentModule) {
+            try { documentModule.streamDocOpen(json.title || '', json.language || ''); } catch (_) {}
+          } else if (json.type === 'doc_stream_delta' && documentModule) {
+            try { documentModule.streamDocDelta(json.content || ''); } catch (_) {}
+          }
+          // agent_step / tool_result / metrics: round structure + final tool
+          // bubbles are produced by the canonical reload below, not here.
+        }
+      }
+    } catch (_) {
+      // fall through to finalize
+    } finally {
+      _streamSessionId = null;
+      killSpinner();
+      if (holder.parentNode) holder.remove();
+      // Render the authoritative final state once the run is done — but only
+      // if the user is still on this session (don't yank them off a new chat).
+      if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        sessionModule.selectSession(sessionId);
+      }
+    }
+    return true;
+  }
+
   // Tag short single-line code blocks with .pre-compact so the CSS can
   // render the Run/Edit/Copy buttons as a slim row that doesn't make a
   // 1-line bash block taller than its own contents.
@@ -4515,6 +4629,7 @@ import createResearchSynapse from './researchSynapse.js';
     continueFrom,
     _appendViewReportLink,
     hasActiveStream,
+    resumeStream,
   };
 
   // Single delegated handler for tool-call fold/expand. One listener on
