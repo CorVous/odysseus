@@ -570,18 +570,36 @@ class ManageDocumentTool:
                 if not docs:
                     msg = "No documents found" + (f" matching '{args['search']}'" if args.get("search") else "") + "."
                     return {"response": msg, "documents": [], "exit_code": 0}
+                # Small result sets: inline a short content preview so a weak model
+                # can answer "what's in my doc" from THIS call, without a second
+                # read it tends to fumble (e.g. hallucinating a read_file path).
+                _inline = len(docs) <= 5
                 lines = []
                 items = []
                 for i, d in enumerate(docs):
-                    size = len(d.current_content or "")
+                    body = d.current_content or ""
+                    size = len(body)
                     lang = d.language or "text"
                     ts = getattr(d, 'updated_at', None) or getattr(d, 'created_at', None)
                     marker = " ← most recent" if i == 0 else ""
+                    # Surface the bare id (the anchor's #document-<id> is easy for a
+                    # small model to miss) so it can pass document_id to read.
                     lines.append(
-                        f"- [{d.title}](#document-{d.id}) — {lang}, {size} chars, updated {_rel(ts)}{marker}"
+                        f"- [{d.title}](#document-{d.id}) — id={d.id}, {lang}, {size} chars, updated {_rel(ts)}{marker}"
                     )
+                    if _inline and body.strip():
+                        snippet = " ".join(body[:500].split())
+                        if len(body) > 500:
+                            snippet += " …"
+                        lines.append(f"    preview: {snippet}")
                     items.append({"id": d.id, "title": d.title, "language": lang, "size": size})
-                header = f"Found {len(docs)} document(s), sorted most-recent first. Click a title to open:"
+                _eg = docs[0].id
+                header = (
+                    f"Found {len(docs)} document(s), most-recent first. To read a document's "
+                    f"FULL contents, call manage_documents with action=\"read\" and "
+                    f"document_id=<id> (e.g. document_id={_eg}) — these are stored in the app, "
+                    f"NOT files on disk, so do not use read_file/bash/cat."
+                )
                 return {
                     "response": header + "\n" + "\n".join(lines),
                     "documents": items,
@@ -590,25 +608,66 @@ class ManageDocumentTool:
 
             elif action in ("read", "view", "open", "get"):
                 doc_id = args.get("document_id") or args.get("id") or args.get("uid")
-                if not doc_id:
-                    return {"error": "Need document_id (use action=list to find one)", "exit_code": 1}
-                doc = _get_owned_document(db, Document, doc_id, owner, active_only=True)
+                doc = None
+                if doc_id is not None and str(doc_id).strip():
+                    doc = _get_owned_document(db, Document, doc_id, owner, active_only=True)
+                # Title fallback: the model usually has the title from `list` but not
+                # the id, and weak models pass the title in the document_id slot.
                 if not doc:
-                    return {"error": f"Document '{doc_id}' not found", "exit_code": 1}
+                    title = args.get("title") or args.get("name")
+                    if not title and isinstance(doc_id, str) and not doc_id.strip().isdigit():
+                        title = doc_id
+                    if title:
+                        tq = _owned_document_query(
+                            db.query(Document).filter(Document.is_active == True), Document, owner
+                        )
+                        matches = tq.filter(Document.title.ilike(f"%{title}%")).order_by(
+                            Document.updated_at.desc()
+                        ).all()
+                        if len(matches) == 1:
+                            doc = matches[0]
+                        elif len(matches) > 1:
+                            rows = "\n".join(f"- {m.title} (document_id={m.id})" for m in matches[:10])
+                            return {"error": f"Multiple documents match '{title}'. Call read again with one document_id:\n{rows}", "exit_code": 1}
+                if not doc:
+                    return {"error": "Need a valid document_id or title (use action=list to see them)", "exit_code": 1}
                 body = doc.current_content or ""
-                preview_limit = int(args.get("limit", MAX_READ_CHARS))
-                truncated = len(body) > preview_limit
-                preview = body[:preview_limit] + (f"\n... (truncated, {len(body)} chars total)" if truncated else "")
+                total = len(body)
+                try:
+                    limit = max(1, int(args.get("limit", MAX_READ_CHARS)))
+                except (TypeError, ValueError):
+                    limit = MAX_READ_CHARS
+                try:
+                    offset = max(0, int(args.get("offset", 0) or 0))
+                except (TypeError, ValueError):
+                    offset = 0
+                offset = min(offset, total)
+                window = body[offset:offset + limit]
+                end = offset + len(window)
+                has_more = end < total
                 anchor = f"[{doc.title}](#document-{doc.id})"
+                # State the exact slice + how to continue, so a truncated read is
+                # never mistaken for the whole document.
+                if offset == 0 and not has_more:
+                    note = f"{anchor} — full contents ({total} chars)."
+                else:
+                    note = f"{anchor} — showing chars {offset}–{end} of {total}."
+                    note += (f" TRUNCATED — there are {total - end} more chars; call read again "
+                             f"with document_id={doc.id} offset={end} to continue."
+                             if has_more else " (reached end of document).")
                 return {
-                    "response": f"{anchor} — click to open in editor.\n\n```{doc.language or ''}\n{preview}\n```",
+                    "response": f"{note}\n\n```{doc.language or ''}\n{window}\n```",
                     "document": {
                         "id": doc.id,
                         "title": doc.title,
                         "language": doc.language,
-                        "size": len(body),
-                        "content": preview,
-                        "truncated": truncated,
+                        "size": total,
+                        "content": window,
+                        "offset": offset,
+                        "returned_chars": len(window),
+                        "truncated": has_more,
+                        "has_more": has_more,
+                        "next_offset": end if has_more else None,
                     },
                     "exit_code": 0,
                 }
