@@ -741,15 +741,17 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_documents",
-            "description": "Manage documents: list all documents (with optional search/language filter), delete documents, or run tidy cleanup.",
+            "description": "List, READ, delete, or tidy stored documents (editor/library). action='read' returns a document's full contents — documents live in the app, NOT on disk, so use this (never read_file/bash) to view a document. Typical flow: action='list' to get ids, then action='read' with document_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "delete", "tidy"]},
-                    "document_id": {"type": "string", "description": "Document ID (for delete)"},
+                    "action": {"type": "string", "enum": ["list", "read", "delete", "tidy"]},
+                    "document_id": {"type": "string", "description": "Document ID (for read/delete). Get it from action='list'."},
+                    "title": {"type": "string", "description": "Alternative to document_id for action='read': match a document by title (exact or partial)."},
                     "search": {"type": "string", "description": "Search query (for list)"},
                     "language": {"type": "string", "description": "Filter by language (for list)"},
-                    "limit": {"type": "integer", "description": "Max results (for list, default 50)"}
+                    "limit": {"type": "integer", "description": "Max results for list (default 50), OR max characters returned for read (default 20000)."},
+                    "offset": {"type": "integer", "description": "For read: start at this character offset (default 0). If a read is truncated it returns next_offset — call read again with offset=next_offset to continue."}
                 },
                 "required": ["action"]
             }
