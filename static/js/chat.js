@@ -3108,69 +3108,81 @@ import createResearchSynapse from './researchSynapse.js';
 
   /**
    * Reattach to an in-progress server run after a FULL PAGE RELOAD.
-   * The in-page background-stream machinery (detach/checkBackgroundStream)
-   * is lost on refresh, so without this the user only sees a bare spinner.
    * The backend tees every run's SSE events into a replay buffer
-   * (src/agent_runs.py); GET /api/chat/resume/<id> replays the backlog
-   * (tools + text emitted so far) then streams live. We render the text and
-   * a tool-activity indicator as they arrive, then reload the session so the
-   * canonical final view (proper tool bubbles, metrics) lands.
-   * Returns true if a resume stream was started; false to let the caller
-   * fall back to its spinner+poll.
+   * (src/agent_runs.py); GET /api/chat/resume/<id> replays the backlog then
+   * streams live. We assemble the same {round_texts, tool_events} structure the
+   * canonical history renderer uses and re-render via chatRenderer.addMessage as
+   * events arrive — so the resumed turn looks IDENTICAL to a non-refreshed one
+   * (multi-round bubbles + expandable agent-thread tool nodes + thinking), with
+   * live progression. On completion we reload the session for the DB-canonical
+   * final render (metrics/footer). Returns true if started; false to let the
+   * caller fall back to its spinner+poll.
    */
   async function resumeStream(sessionId) {
     if (!sessionId) return false;
-    if (hasActiveStream(sessionId)) return true; // foreground/background (or another resume) already handles it
+    if (hasActiveStream(sessionId)) return true; // already handled (foreground/another resume)
     _streamSessionId = sessionId;  // claim synchronously so a second resume call dedupes via hasActiveStream
     let res;
     try {
       res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`, { credentials: 'same-origin' });
-    } catch (_) {
-      _streamSessionId = null;
-      return false;
-    }
+    } catch (_) { _streamSessionId = null; return false; }
     if (!res.ok || !res.body) { _streamSessionId = null; return false; }
 
     const box = document.getElementById('chat-history');
     if (!box) { _streamSessionId = null; return false; }
 
     const meta = sessionModule.getSessions().find((s) => s.id === sessionId);
-    const roleLabel = _shortModel(meta && meta.model);
-    const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const holder = document.createElement('div');
-    holder.className = 'msg msg-ai';
-    holder.innerHTML = '<div class="role">' + roleLabel + ' <span class="role-timestamp">' + roleTs +
-      '</span></div><div class="body"></div>' +
-      '<div class="resume-tool" style="opacity:.65;font-size:.85em;margin-top:4px;"></div>';
-    _applyModelColor(holder.querySelector('.role'), meta && meta.model);
-    const bodyDiv = holder.querySelector('.body');
-    const toolDiv = holder.querySelector('.resume-tool');
-    const spinner = spinnerModule.create('Reconnecting to in-progress response…', 'right');
-    bodyDiv.appendChild(spinner.createElement());
-    spinner.start();
-    box.appendChild(holder);
-    uiModule.scrollHistory();
+    const model = (meta && meta.model) || '';
 
-    _streamSessionId = sessionId;            // make hasActiveStream() report active
+    // A lightweight "reconnecting" placeholder until the first content renders.
+    const ph = document.createElement('div');
+    ph.className = 'msg msg-ai resume-rendered';
+    ph.innerHTML = '<div class="body"></div>';
+    const spinner = spinnerModule.create('Reconnecting to in-progress response…', 'right');
+    ph.querySelector('.body').appendChild(spinner.createElement());
+    spinner.start();
+    box.appendChild(ph);
+    uiModule.scrollHistory();
+    let phGone = false;
+    const killPlaceholder = () => { if (!phGone) { try { spinner.destroy(); } catch (_) {} if (ph.parentNode) ph.remove(); phGone = true; } };
+
+    // Accumulated structure, identical in shape to a persisted agent message.
+    const round_texts = [];
+    const tool_events = [];
+    let curRound = 0;            // 0-based index into round_texts (round 1)
+    let thinkOpen = false;
+    const addText = (d) => { round_texts[curRound] = (round_texts[curRound] || '') + d; };
+
+    // Re-render the whole in-progress message through the canonical renderer,
+    // replacing our previous render. Debounced to coalesce token bursts.
+    let rerenderTimer = null;
+    const doRerender = () => {
+      rerenderTimer = null;
+      if (sessionModule.getCurrentSessionId() !== sessionId) return;
+      killPlaceholder();
+      box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
+      const before = new Set(Array.from(box.children));
+      const md = { model, timestamp: Date.now() };
+      try {
+        if (tool_events.length) {
+          md.round_texts = round_texts;
+          md.tool_events = tool_events;
+          addMessage('assistant', null, model, md);
+        } else {
+          addMessage('assistant', round_texts.join('\n\n'), model, md);
+        }
+      } catch (_) { /* keep streaming even if a render hiccups */ }
+      Array.from(box.children).forEach((c) => { if (!before.has(c)) c.classList.add('resume-rendered'); });
+      uiModule.scrollHistory();
+    };
+    const scheduleRerender = () => { if (!rerenderTimer) rerenderTimer = setTimeout(doRerender, 140); };
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let accumulated = '';
-    let thinkOpen = false;
-    let spinnerGone = false;
-
-    const killSpinner = () => { if (!spinnerGone) { try { spinner.destroy(); } catch (_) {} spinnerGone = true; } };
-    const renderBody = () => {
-      killSpinner();
-      bodyDiv.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(accumulated));
-      if (window.hljs) bodyDiv.querySelectorAll('pre code').forEach((b) => window.hljs.highlightElement(b));
-      uiModule.scrollHistory();
-    };
-
     let done = false;
     try {
       while (!done) {
-        // User navigated away — stop rendering into this (now hidden) view.
         if (sessionModule.getCurrentSessionId() !== sessionId) { try { reader.cancel(); } catch (_) {} break; }
         const { value, done: rdone } = await reader.read();
         if (rdone) break;
@@ -3187,36 +3199,44 @@ import createResearchSynapse from './researchSynapse.js';
             let d = json.delta;
             if (json.thinking) { if (!thinkOpen) { d = '<think>' + d; thinkOpen = true; } }
             else if (thinkOpen) { d = '</think>' + d; thinkOpen = false; }
-            accumulated += d;
-            renderBody();
+            addText(d);
+            scheduleRerender();
+          } else if (json.type === 'agent_step') {
+            if (thinkOpen) { addText('</think>'); thinkOpen = false; }
+            if (typeof json.round === 'number' && json.round > 0) curRound = json.round - 1;
           } else if (json.type === 'tool_start') {
-            killSpinner();
-            const t = json.tool || 'tool';
-            const c = (json.command || '').split('\n')[0].slice(0, 80);
-            toolDiv.textContent = '⚙ ' + t + (c ? ': ' + c : '') + ' …';
-          } else if (json.type === 'tool_progress') {
-            if (json.elapsed_s != null && toolDiv.textContent) {
-              toolDiv.textContent = toolDiv.textContent.replace(/ \(\d+s\)$/, '') + ' (' + Math.round(json.elapsed_s) + 's)';
+            tool_events.push({ round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '', output: '', exit_code: null, _pending: true });
+            scheduleRerender();
+          } else if (json.type === 'tool_output') {
+            // Fill the matching pending tool node (or push if we missed its start).
+            let ev = null;
+            for (let i = tool_events.length - 1; i >= 0; i--) {
+              if (tool_events[i]._pending && tool_events[i].tool === json.tool) { ev = tool_events[i]; break; }
             }
+            if (!ev) { ev = { round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '' }; tool_events.push(ev); }
+            ev.output = json.output || ''; ev.exit_code = json.exit_code; ev._pending = false;
+            scheduleRerender();
           } else if (json.type === 'doc_stream_open' && documentModule) {
             try { documentModule.streamDocOpen(json.title || '', json.language || ''); } catch (_) {}
           } else if (json.type === 'doc_stream_delta' && documentModule) {
             try { documentModule.streamDocDelta(json.content || ''); } catch (_) {}
           }
-          // agent_step / tool_result / metrics: round structure + final tool
-          // bubbles are produced by the canonical reload below, not here.
         }
       }
     } catch (_) {
       // fall through to finalize
     } finally {
+      if (rerenderTimer) { clearTimeout(rerenderTimer); rerenderTimer = null; }
+      // Flush a final render — when the backlog + [DONE] arrive in one burst the
+      // debounced timer would otherwise be cancelled here before it ever fired.
+      try { doRerender(); } catch (_) {}
       _streamSessionId = null;
-      killSpinner();
-      if (holder.parentNode) holder.remove();
-      // Render the authoritative final state once the run is done — but only
-      // if the user is still on this session (don't yank them off a new chat).
+      killPlaceholder();
       if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        // Reload for the DB-canonical final render (metrics, footer, persisted ids).
         sessionModule.selectSession(sessionId);
+      } else {
+        box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
       }
     }
     return true;
