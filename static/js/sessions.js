@@ -2877,17 +2877,28 @@ async function _renderLibDocuments(grid) {
       card.addEventListener('click', (e) => {
         if (e.target.closest('.archive-menu-btn,.memory-select-cb')) return;
         if (_lib.selectMode) { _toggleLibSelect(card, d.id); return; }
-        // Open document in its session
-        if (d.session_id && window.documentModule) {
+        if (!window.documentModule) return;
+        if (d.session_id) {
+          // Open in its original chat
           closeLibrary();
           selectSession(d.session_id);
           setTimeout(() => { if (window.documentModule.loadSessionDocs) window.documentModule.loadSessionDocs(d.session_id); }, 300);
+        } else if (window.documentModule.loadDocument) {
+          // Orphaned doc (its chat was deleted → session_id NULL). Still openable
+          // directly in the editor by id — don't strand it behind a dead session.
+          closeLibrary();
+          window.documentModule.loadDocument(d.id);
         }
       });
       card.querySelector('.archive-menu-btn').addEventListener('click', (e) => {
         e.stopPropagation();
         _showDropdown(e.currentTarget, [
-          { label: 'Open', action: () => { if (d.session_id) { closeLibrary(); selectSession(d.session_id); } } },
+          { label: 'Open', action: () => {
+            if (!window.documentModule) return;
+            closeLibrary();
+            if (d.session_id) selectSession(d.session_id);
+            else if (window.documentModule.loadDocument) window.documentModule.loadDocument(d.id);
+          } },
           { label: 'Delete', action: async () => { if (!await uiModule.styledConfirm('Delete?', { confirmText: 'Delete', danger: true })) return; await fetch(`${API_BASE}/api/document/${d.id}`, { method: 'DELETE' }); _renderLibGrid(); }, danger: true },
         ]);
       });
