@@ -200,15 +200,22 @@ function initializeEventListeners() {
     requestAnimationFrame(() => { _touchThrottled = false; });
   }, { passive: true });
 
-  // Internal #session-id links from AI search results
+  // Internal bare #session-id links (legacy AI search results).
+  // Entity jump-links — #session-<id>, #document-<id>, #note-<id>, etc. — are
+  // routed by the canonical delegate in chatRenderer.js, which strips the kind
+  // prefix and opens the right thing (loadDocument for documents, selectSession
+  // for sessions, …). markdown.js tags EVERY hash anchor with .chat-link, so we
+  // must NOT treat them all as session ids here: doing so fed "document-<id>"
+  // into selectSession, which 404'd the history fetch and bounced the user to
+  // the welcome screen. Skip any kind-prefixed anchor and let chatRenderer own it.
   el('chat-history').addEventListener('click', (e) => {
     const link = e.target.closest('a.chat-link');
     if (!link) return;
     const href = link.getAttribute('href');
-    if (href && href.startsWith('#') && sessionModule) {
-      e.preventDefault();
-      sessionModule.selectSession(href.slice(1));
-    }
+    if (!href || !href.startsWith('#') || !sessionModule) return;
+    if (/^#(session|document|note|image|email|event|task|skill|research)-/.test(href)) return;
+    e.preventDefault();
+    sessionModule.selectSession(href.slice(1));
   });
 
   // Export dropdown button
