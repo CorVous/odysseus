@@ -9,6 +9,11 @@ from typing import Optional, Dict, Any, Tuple
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
 
+# Default number of lines a single read_file call returns when the model doesn't
+# ask for a specific window. Line-based pagination (offset/limit) lets it walk a
+# large file without ever re-reading the same head.
+DEFAULT_READ_LINES = 500
+
 _CODENAV_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
@@ -132,7 +137,7 @@ class EditFileTool:
 
 class ReadFileTool:
     async def execute(self, content: str, ctx: dict) -> dict:
-        from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
+        from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate, _parse_read_window
         raw_path, offset, limit = content.split("\n", 1)[0].strip(), 0, 0
         _stripped = content.strip()
         if _stripped.startswith("{"):
@@ -143,31 +148,20 @@ class ReadFileTool:
                 limit = int(_a.get("limit") or 0)
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
+        else:
+            # Fenced-block text protocol: `path` then optional `offset=N`/`limit=N`
+            # tokens (on the path line or a following line). Strips the tokens to
+            # recover the path; a plain path parses unchanged.
+            raw_path, offset, limit = _parse_read_window(content)
         try:
             path = _resolve_tool_path(raw_path)
         except ValueError as e:
             return {"error": f"read_file: {e}", "exit_code": 1}
         try:
             def _read():
-                if offset > 0 or limit > 0:
-                    start = max(offset, 1)
-                    out, n, budget = [], 0, MAX_READ_CHARS
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        for i, line in enumerate(f, 1):
-                            if i < start:
-                                continue
-                            if limit > 0 and n >= limit:
-                                break
-                            out.append(line)
-                            n += 1
-                            budget -= len(line)
-                            if budget <= 0:
-                                out.append(f"\n... [truncated at {MAX_READ_CHARS} chars]")
-                                break
-                    return "".join(out)
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read(MAX_READ_CHARS + 1)
-            data = await asyncio.to_thread(_read)
+                    return f.readlines()
+            lines = await asyncio.to_thread(_read)
         except FileNotFoundError:
             return {"error": f"read_file: {path}: not found", "exit_code": 1}
         except PermissionError:
@@ -176,8 +170,35 @@ class ReadFileTool:
             return {"error": f"read_file: {path}: is a directory (use ls)", "exit_code": 1}
         except OSError as e:
             return {"error": f"read_file: {path}: {e}", "exit_code": 1}
-        if not (offset > 0 or limit > 0) and len(data) > MAX_READ_CHARS:
-            data = data[:MAX_READ_CHARS] + f"\n... [truncated at {MAX_READ_CHARS} chars]"
+        total = len(lines)
+        # 1-based start line; limit<=0 means "default page size".
+        start = max(1, offset)
+        page = limit if limit > 0 else DEFAULT_READ_LINES
+        window = lines[start - 1:start - 1 + page]
+        # Char safety net: stop at the last whole line that fits MAX_READ_CHARS
+        # (one runaway long line is hard-cut so we always make progress).
+        out, chars = [], 0
+        for ln in window:
+            if out and chars + len(ln) > MAX_READ_CHARS:
+                break
+            if not out and len(ln) > MAX_READ_CHARS:
+                ln = ln[:MAX_READ_CHARS]
+            out.append(ln)
+            chars += len(ln)
+        shown = len(out)
+        last = start - 1 + shown  # last line number actually returned
+        data = "".join(out)
+        # Self-describing cursor: tell the model exactly how to continue, so a
+        # forgetful model never has to remember where it stopped.
+        if start > total and total > 0:
+            data = (data + f"\n... [offset {start} is past end of file "
+                    f"({total} lines total)]")
+        elif last < total:
+            data = (data + f"\n... [showing lines {start}-{last} of {total}; "
+                    f"more remains — call read_file again with offset={last + 1} "
+                    f"to continue]")
+        elif start > 1:
+            data = data + f"\n... [end of file — lines {start}-{total} of {total}]"
         return {"output": data, "exit_code": 0}
 
 class WriteFileTool:

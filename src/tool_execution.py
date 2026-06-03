@@ -20,7 +20,6 @@ import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 
-
 from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_user
 from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
@@ -33,7 +32,10 @@ from src.tool_utils import _truncate, get_mcp_manager
 # in ephemeral container layers that are lost on the next rebuild.
 _AGENT_WORKDIR = DATA_DIR
 
-
+# Default number of lines a single read_file call returns when the model
+# doesn't ask for a specific window. Pagination (offset/limit) lets it walk
+# a large file without ever re-reading the same head — see _parse_read_window.
+DEFAULT_READ_LINES = 500
 
 # ---------------------------------------------------------------------------
 # Path confinement for read_file / write_file
@@ -378,12 +380,35 @@ def _parse_write_file(content: str) -> Dict:
     return {"path": lines[0].strip(), "content": lines[1] if len(lines) > 1 else ""}
 
 
+_READ_WINDOW_RE = re.compile(r"\b(offset|limit)\s*=\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_read_window(content: str) -> Tuple[str, int, int]:
+    """Parse a read_file block into (path, offset, limit).
+
+    Accepts optional `offset=N` / `limit=N` tokens either appended to the path
+    line (`src/foo.ts offset=320`) or on a following line. offset is a 1-based
+    start line, limit a max line count; both default to 0 ("from the top, one
+    default page"). Tokens are stripped from the first line to recover the path,
+    so paths without those tokens parse exactly as before.
+    """
+    path_line = content.split("\n", 1)[0]
+    offset = limit = 0
+    for m in _READ_WINDOW_RE.finditer(content):
+        if m.group(1).lower() == "offset":
+            offset = int(m.group(2))
+        else:
+            limit = int(m.group(2))
+    path = _READ_WINDOW_RE.sub("", path_line).strip()
+    return path, offset, limit
+
+
 _MCP_ARG_PARSERS: Dict[str, Callable[[str], Dict[str, str]]] = {
     "bash":           lambda c: {"command": c},
     "python":         lambda c: {"code": c},
     "web_search":     lambda c: {"query": c.split("\n")[0].strip()},
     "web_fetch":      lambda c: {"url": c.split("\n")[0].strip()},
-    "read_file":      lambda c: {"path": c.split("\n")[0].strip()},
+    "read_file":      lambda c: (lambda p, o, l: {"path": p, **({"offset": o} if o else {}), **({"limit": l} if l else {})})(*_parse_read_window(c)),
     "write_file":     _parse_write_file,
     "generate_image": _parse_generate_image,
     "manage_memory":  _parse_manage_memory,
