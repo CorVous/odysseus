@@ -209,8 +209,10 @@ Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check ex
     "read_file": """\
 ```read_file
 <file path>
+offset=<start line>   # optional, 1-based; omit to start at the top
+limit=<max lines>     # optional; omit for the default page size
 ```
-Read a file and return its contents.""",
+Read a file and return its contents. Large files come back one page at a time. If the output ends with `... more remains — call read_file again with offset=N`, call it again with that exact `offset` to get the next page — do NOT re-read from the top, and do NOT keep re-reading the same offset (you already have those lines).""",
 
     "write_file": """\
 ```write_file

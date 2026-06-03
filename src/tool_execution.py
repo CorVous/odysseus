@@ -12,6 +12,7 @@ import collections
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -20,6 +21,10 @@ from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_u
 
 MAX_OUTPUT_CHARS = 10_000
 MAX_READ_CHARS = 20_000
+# Default number of lines a single read_file call returns when the model
+# doesn't ask for a specific window. Pagination (offset/limit) lets it walk
+# a large file without ever re-reading the same head — see _parse_read_window.
+DEFAULT_READ_LINES = 500
 
 # ---------------------------------------------------------------------------
 # Path confinement for read_file / write_file
@@ -374,12 +379,35 @@ def _parse_write_file(content: str) -> Dict:
     return {"path": lines[0].strip(), "content": lines[1] if len(lines) > 1 else ""}
 
 
+_READ_WINDOW_RE = re.compile(r"\b(offset|limit)\s*=\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_read_window(content: str) -> Tuple[str, int, int]:
+    """Parse a read_file block into (path, offset, limit).
+
+    Accepts optional `offset=N` / `limit=N` tokens either appended to the path
+    line (`src/foo.ts offset=320`) or on a following line. offset is a 1-based
+    start line, limit a max line count; both default to 0 ("from the top, one
+    default page"). Tokens are stripped from the first line to recover the path,
+    so paths without those tokens parse exactly as before.
+    """
+    path_line = content.split("\n", 1)[0]
+    offset = limit = 0
+    for m in _READ_WINDOW_RE.finditer(content):
+        if m.group(1).lower() == "offset":
+            offset = int(m.group(2))
+        else:
+            limit = int(m.group(2))
+    path = _READ_WINDOW_RE.sub("", path_line).strip()
+    return path, offset, limit
+
+
 _MCP_ARG_PARSERS: Dict[str, callable] = {
     "bash":           lambda c: {"command": c},
     "python":         lambda c: {"code": c},
     "web_search":     lambda c: {"query": c.split("\n")[0].strip()},
     "web_fetch":      lambda c: {"url": c.split("\n")[0].strip()},
-    "read_file":      lambda c: {"path": c.split("\n")[0].strip()},
+    "read_file":      lambda c: (lambda p, o, l: {"path": p, **({"offset": o} if o else {}), **({"limit": l} if l else {})})(*_parse_read_window(c)),
     "write_file":     _parse_write_file,
     "generate_image": _parse_generate_image,
     "manage_memory":  _parse_manage_memory,
@@ -512,7 +540,7 @@ async def _direct_fallback(
             return {"output": output or "(no output)", "exit_code": rc or 0}
 
         if tool == "read_file":
-            raw_path = content.split("\n", 1)[0].strip()
+            raw_path, offset, limit = _parse_read_window(content)
             try:
                 path = _resolve_tool_path(raw_path)
             except ValueError as e:
@@ -521,17 +549,43 @@ async def _direct_fallback(
                 # Run blocking read in a thread to keep the loop responsive
                 def _read():
                     with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        return f.read(MAX_READ_CHARS + 1)
-                data = await asyncio.to_thread(_read)
+                        return f.readlines()
+                lines = await asyncio.to_thread(_read)
             except FileNotFoundError:
                 return {"error": f"read_file: {path}: not found", "exit_code": 1}
             except PermissionError:
                 return {"error": f"read_file: {path}: permission denied", "exit_code": 1}
             except OSError as e:
                 return {"error": f"read_file: {path}: {e}", "exit_code": 1}
-            truncated = len(data) > MAX_READ_CHARS
-            if truncated:
-                data = data[:MAX_READ_CHARS] + f"\n... [truncated at {MAX_READ_CHARS} chars]"
+            total = len(lines)
+            # 1-based start line; limit<=0 means "default page size".
+            start = max(1, offset)
+            page = limit if limit > 0 else DEFAULT_READ_LINES
+            window = lines[start - 1:start - 1 + page]
+            # Char safety net: stop at the last whole line that fits MAX_READ_CHARS
+            # (one runaway long line is hard-cut so we always make progress).
+            out, chars = [], 0
+            for ln in window:
+                if out and chars + len(ln) > MAX_READ_CHARS:
+                    break
+                if not out and len(ln) > MAX_READ_CHARS:
+                    ln = ln[:MAX_READ_CHARS]
+                out.append(ln)
+                chars += len(ln)
+            shown = len(out)
+            last = start - 1 + shown  # last line number actually returned
+            data = "".join(out)
+            # Self-describing cursor: tell the model exactly how to continue,
+            # so a forgetful model never has to remember where it stopped.
+            if start > total and total > 0:
+                data = (data + f"\n... [offset {start} is past end of file "
+                        f"({total} lines total)]")
+            elif last < total:
+                data = (data + f"\n... [showing lines {start}-{last} of {total}; "
+                        f"more remains — call read_file again with offset={last + 1} "
+                        f"to continue]")
+            elif start > 1:
+                data = data + f"\n... [end of file — lines {start}-{total} of {total}]"
             return {"output": data, "exit_code": 0}
 
         if tool == "write_file":

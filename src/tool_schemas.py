@@ -82,11 +82,13 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from disk",
+            "description": "Read a file from disk. Large files are returned one page at a time; if the result ends with '... more remains — call read_file again with offset=N', call again with that offset to read the next page. Do NOT re-read the same file without advancing offset.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to read"}
+                    "path": {"type": "string", "description": "File path to read"},
+                    "offset": {"type": "integer", "description": "1-based line number to start reading from (default 1). Use the value from the previous read's continuation hint to page through a large file."},
+                    "limit": {"type": "integer", "description": "Max number of lines to return (default 500)."}
                 },
                 "required": ["path"]
             }
@@ -1112,6 +1114,16 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = args.get("query", "")
     elif tool_type == "read_file":
         content = args.get("path", "")
+        extras = []
+        for _k in ("offset", "limit"):
+            try:
+                _v = int(args.get(_k))
+            except (TypeError, ValueError):
+                _v = 0
+            if _v > 0:
+                extras.append(f"{_k}={_v}")
+        if extras:
+            content += "\n" + " ".join(extras)
     elif tool_type == "write_file":
         content = args.get("path", "") + "\n" + args.get("content", "")
     elif tool_type == "create_document":
