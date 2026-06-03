@@ -10,7 +10,9 @@
 // v327: force re-precache so clients pick up the updated chat.js + sessions.js
 // (resume-stream-on-reload fix) — the unversioned sessions.js was being served
 // stale from an older SW cache.
-const CACHE_NAME = 'odysseus-v327';
+// v328: drop the chat.js self-trigger (it raced with the history re-render and
+// wiped the resume bubble); resume is driven solely by sessions._checkServerStream.
+const CACHE_NAME = 'odysseus-v328';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags

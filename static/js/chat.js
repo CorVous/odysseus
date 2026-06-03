@@ -163,10 +163,6 @@ import createResearchSynapse from './researchSynapse.js';
       const ta = document.getElementById('message');
       if (ta && mod.initSlashAutocomplete) mod.initSlashAutocomplete(ta);
     }).catch(() => {});
-    // Reattach to an in-progress run after a reload — driven from chat.js so it
-    // works even on clients still serving a cached/stale sessions.js (whose
-    // _checkServerStream would otherwise be the only caller of resumeStream).
-    try { _resumeOnLoadOnce(); } catch (_) {}
   }
 
   // addMessage, createMsgFooter, displayMetrics, hideWelcomeScreen, showWelcomeScreen
@@ -3125,7 +3121,7 @@ import createResearchSynapse from './researchSynapse.js';
   async function resumeStream(sessionId) {
     if (!sessionId) return false;
     if (hasActiveStream(sessionId)) return true; // foreground/background (or another resume) already handles it
-    _streamSessionId = sessionId;  // claim synchronously so concurrent callers (sessions._checkServerStream + _resumeOnLoadOnce) dedupe via hasActiveStream
+    _streamSessionId = sessionId;  // claim synchronously so a second resume call dedupes via hasActiveStream
     let res;
     try {
       res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`, { credentials: 'same-origin' });
@@ -3224,30 +3220,6 @@ import createResearchSynapse from './researchSynapse.js';
       }
     }
     return true;
-  }
-
-  // Self-contained resume-on-reload trigger. Lives in chat.js (which clients
-  // refresh via its ?v= stamp / no-cache revalidation) so it works even when a
-  // cached, stale sessions.js never calls resumeStream from _checkServerStream.
-  // Polls briefly for the restored session, then attaches. Harmless when no run
-  // is active (resumeStream 404s and no-ops); resumeStream's own hasActiveStream
-  // guard prevents a double-attach with sessions._checkServerStream on fresh
-  // clients.
-  function _resumeOnLoadOnce() {
-    let tries = 0;
-    const iv = setInterval(async () => {
-      tries++;
-      let sid = null;
-      try { sid = sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId(); } catch (_) {}
-      if (sid) {
-        clearInterval(iv);
-        if (!hasActiveStream(sid)) {
-          try { await resumeStream(sid); } catch (_) {}
-        }
-      } else if (tries >= 30) {
-        clearInterval(iv); // ~15s with no restored session — give up
-      }
-    }, 500);
   }
 
   // Tag short single-line code blocks with .pre-compact so the CSS can
