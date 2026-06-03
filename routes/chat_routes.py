@@ -1185,6 +1185,19 @@ def setup_chat_routes(
                                     last_metrics["requested_model"] = last_metrics.get("requested_model") or _requested_model
                                     last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
+                                else:
+                                    # Default-forward every other agent event verbatim.
+                                    # The branches above exist only to do bookkeeping
+                                    # (accumulate text, count rounds/tools, relabel the
+                                    # metrics model); they are NOT an allow-list. Anything
+                                    # not needing a transform must still reach the client.
+                                    # Previously unrecognised types fell through here and
+                                    # were silently dropped — e.g. budget_exceeded (the
+                                    # "agent hit its tool budget and stopped" notice) and
+                                    # tool_progress (live long-running-tool updates) — so
+                                    # the user saw tool calls/bubbles just stop with no
+                                    # explanation, unrecoverable on reload.
+                                    yield chunk
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):
