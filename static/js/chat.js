@@ -3200,17 +3200,27 @@ import createResearchSynapse from './researchSynapse.js';
       removeThinking();  // keep the spinner below freshly-rendered content (bump re-adds it)
       box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
       const before = new Set(Array.from(box.children));
+      // While a <think> block is still streaming (no </think> yet), close it just
+      // for rendering so it formats as a thinking section instead of raw text.
+      const rt = round_texts.slice();
+      if (thinkOpen && rt.length) rt[curRound] = (rt[curRound] || '') + '</think>';
       const md = { model, timestamp: Date.now() };
       try {
         if (tool_events.length) {
-          md.round_texts = round_texts;
+          md.round_texts = rt;
           md.tool_events = tool_events;
           addMessage('assistant', null, model, md);
         } else {
-          addMessage('assistant', round_texts.join('\n\n'), model, md);
+          addMessage('assistant', rt.join('\n\n'), model, md);
         }
       } catch (_) { /* keep streaming even if a render hiccups */ }
       Array.from(box.children).forEach((c) => { if (!before.has(c)) c.classList.add('resume-rendered'); });
+      // Keep the still-streaming thinking section expanded (matches the live view,
+      // which shows thinking open while it streams, then collapses when done).
+      if (thinkOpen) {
+        const tcs = box.querySelectorAll('.resume-rendered .thinking-content');
+        if (tcs.length) tcs[tcs.length - 1].classList.add('expanded');
+      }
       uiModule.scrollHistory();
     };
     const scheduleRerender = () => { if (!rerenderTimer) rerenderTimer = setTimeout(doRerender, 140); };
