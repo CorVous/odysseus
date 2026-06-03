@@ -11,6 +11,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from src.pagination import paginate_lines
+
 MAX_OUTPUT_CHARS = 10_000
 MAX_READ_CHARS = 20_000
 
@@ -1497,28 +1499,29 @@ async def do_manage_documents(content: str, owner: Optional[str] = None) -> Dict
             if not doc:
                 return {"error": "Need a valid document_id or title (use action=list to see them)", "exit_code": 1}
             body = doc.current_content or ""
-            total = len(body)
             try:
-                limit = max(1, int(args.get("limit", MAX_READ_CHARS)))
-            except (TypeError, ValueError):
-                limit = MAX_READ_CHARS
-            try:
-                offset = max(0, int(args.get("offset", 0) or 0))
+                offset = int(args.get("offset", 0) or 0)
             except (TypeError, ValueError):
                 offset = 0
-            offset = min(offset, total)
-            window = body[offset:offset + limit]
-            end = offset + len(window)
-            has_more = end < total
+            try:
+                limit = int(args.get("limit", 0) or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            # Line-based pagination, unified with read_file (see src/pagination).
+            pg = paginate_lines(body, offset, limit)
+            window = pg["data"]
+            start, last, total, has_more = pg["start"], pg["last"], pg["total"], pg["has_more"]
             anchor = f"[{doc.title}](#document-{doc.id})"
             # State the exact slice + how to continue, so a truncated read is
             # never mistaken for the whole document.
-            if offset == 0 and not has_more:
-                note = f"{anchor} — full contents ({total} chars)."
+            if pg["past_eof"]:
+                note = f"{anchor} — offset {start} is past end of document ({total} lines total)."
+            elif start <= 1 and not has_more:
+                note = f"{anchor} — full contents ({total} lines)."
             else:
-                note = f"{anchor} — showing chars {offset}–{end} of {total}."
-                note += (f" TRUNCATED — there are {total - end} more chars; call read again "
-                         f"with document_id={doc.id} offset={end} to continue."
+                note = f"{anchor} — showing lines {start}–{last} of {total}."
+                note += (f" TRUNCATED — call read again with document_id={doc.id} "
+                         f"offset={last + 1} to continue."
                          if has_more else " (reached end of document).")
             return {
                 "response": f"{note}\n\n```{doc.language or ''}\n{window}\n```",
@@ -1526,13 +1529,14 @@ async def do_manage_documents(content: str, owner: Optional[str] = None) -> Dict
                     "id": doc.id,
                     "title": doc.title,
                     "language": doc.language,
-                    "size": total,
+                    "size": len(body),
+                    "lines": total,
                     "content": window,
-                    "offset": offset,
-                    "returned_chars": len(window),
+                    "offset": start,
+                    "returned_lines": last - start + 1 if window else 0,
                     "truncated": has_more,
                     "has_more": has_more,
-                    "next_offset": end if has_more else None,
+                    "next_offset": last + 1 if has_more else None,
                 },
                 "exit_code": 0,
             }
