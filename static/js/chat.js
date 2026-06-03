@@ -3134,6 +3134,15 @@ import createResearchSynapse from './researchSynapse.js';
     const meta = sessionModule.getSessions().find((s) => s.id === sessionId);
     const model = (meta && meta.model) || '';
 
+    // We rebuild the resumed message on each update; without this, the per-message
+    // `msg-enter` entry animation replays every rebuild and the card flashes.
+    if (!document.getElementById('resume-noanim-style')) {
+      const _st = document.createElement('style');
+      _st.id = 'resume-noanim-style';
+      _st.textContent = '.resume-rendered { animation: none !important; }';
+      document.head.appendChild(_st);
+    }
+
     // A lightweight "reconnecting" placeholder until the first content renders.
     const ph = document.createElement('div');
     ph.className = 'msg msg-ai resume-rendered';
