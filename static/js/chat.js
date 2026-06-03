@@ -3134,6 +3134,14 @@ import createResearchSynapse from './researchSynapse.js';
     const meta = sessionModule.getSessions().find((s) => s.id === sessionId);
     const model = (meta && meta.model) || '';
 
+    // We're reattaching to a live, detached run — surface the Stop control so the
+    // user can cancel it. The send button's stop branch keys off `isStreaming`
+    // (set here) and calls abortCurrentRequest(true), which POSTs /api/chat/stop
+    // for `_streamSessionId` (set above). Without this the resumed turn streamed
+    // in with no way to stop it short of a hard refresh.
+    const _resumeSubmitBtn = document.querySelector('.send-btn');
+    if (_resumeSubmitBtn) updateSubmitButton('streaming', _resumeSubmitBtn);
+
     // We rebuild the resumed message on each update; without this, the per-message
     // `msg-enter` entry animation replays every rebuild and the card flashes.
     if (!document.getElementById('resume-noanim-style')) {
@@ -3233,6 +3241,7 @@ import createResearchSynapse from './researchSynapse.js';
       while (!done) {
         if (sessionModule.getCurrentSessionId() !== sessionId) { try { reader.cancel(); } catch (_) {} break; }
         const { value, done: rdone } = await reader.read();
+        _lastReaderActivity = Date.now();   // keep the tab-recovery watchdog from false-firing on resume
         if (rdone) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -3288,6 +3297,10 @@ import createResearchSynapse from './researchSynapse.js';
       _streamSessionId = null;
       killPlaceholder();
       if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        // Run ended — clear the Stop control / isStreaming flag promptly
+        // (selectSession also resets the button, but async after a history fetch).
+        const _sb = document.querySelector('.send-btn');
+        if (_sb) updateSubmitButton('idle', _sb);
         // Reload for the DB-canonical final render (metrics, footer, persisted ids).
         sessionModule.selectSession(sessionId);
       } else {

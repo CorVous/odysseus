@@ -12,7 +12,9 @@
 // stale from an older SW cache.
 // v328: drop the chat.js self-trigger (it raced with the history re-render and
 // wiped the resume bubble); resume is driven solely by sessions._checkServerStream.
-const CACHE_NAME = 'odysseus-v332';
+// v329-v332: parity render, no-flash, per-round spinner, expanded in-progress think.
+// v336: resume reattach restores the Stop button.
+const CACHE_NAME = 'odysseus-v336';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
