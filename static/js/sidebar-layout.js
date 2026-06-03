@@ -505,6 +505,13 @@ function _initChatSwipeToOpenSidebar() {
   document.addEventListener('touchstart', (e) => {
     reset();
     if (window.innerWidth >= 768) return;
+    // Respect the user setting (Settings → Appearance → Chat Area →
+    // "Swipe to Open Sidebar"). Read live so toggling takes effect without a
+    // reload. Absent/true = on; only an explicit false disables the gesture.
+    try {
+      const vis = window.loadUIVis && window.loadUIVis();
+      if (vis && vis['swipe-to-open'] === false) return;
+    } catch (_) {}
     if (!e.touches || e.touches.length !== 1) return;
     if (window._chipDragging) return;
     const sb = document.getElementById('sidebar');

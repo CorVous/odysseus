@@ -7,6 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
+// v327: add "Swipe to Open Sidebar" toggle (index.html + sidebar-layout.js).
 const CACHE_NAME = 'odysseus-v327';
 
 // Core shell precached on install so repeat opens are instant without any
