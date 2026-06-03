@@ -3162,6 +3162,34 @@ import createResearchSynapse from './researchSynapse.js';
     let thinkOpen = false;
     const addText = (d) => { round_texts[curRound] = (round_texts[curRound] || '') + d; };
 
+    // Per-round "generating" indicator — mirrors the live view's
+    // agent-thinking-dots spinner: shown whenever the run is active but
+    // momentarily producing no new content (turn start, between rounds, while
+    // the LLM is generating the next response), cleared as soon as content
+    // arrives. Without this the resumed turn has no "it's working" cue.
+    let _lastTool = '';
+    const _TLABELS = { web_search:'Searching', bash:'Running', python:'Running',
+      read_file:'Reading', write_file:'Writing', create_document:'Writing',
+      update_document:'Writing', manage_documents:'Reading', generate_image:'Generating',
+      manage_memory:'Remembering', trigger_research:'Researching' };
+    const _thinkLabel = () => _TLABELS[(_lastTool || '').toLowerCase()] || 'Thinking';
+    const removeThinking = () => {
+      const e = box.querySelector('.agent-thinking-dots');
+      if (e) { if (e._spinner) { try { e._spinner.destroy(); } catch (_) {} } e.remove(); }
+    };
+    let thinkTimer = null;
+    const showThinking = () => {
+      if (sessionModule.getCurrentSessionId() !== sessionId) return;
+      removeThinking();
+      const t = document.createElement('div'); t.className = 'msg msg-ai agent-thinking-dots';
+      const bd = document.createElement('div'); bd.className = 'body';
+      const sp = spinnerModule.create(_thinkLabel(), 'right', 'wave');
+      bd.appendChild(sp.createElement()); try { sp.start(120); } catch (_) {}
+      t._spinner = sp; t.appendChild(bd); box.appendChild(t); uiModule.scrollHistory();
+    };
+    // Remove now, re-show after a short pause (so steady streaming never flickers it).
+    const bumpThinking = () => { removeThinking(); if (thinkTimer) clearTimeout(thinkTimer); thinkTimer = setTimeout(showThinking, 450); };
+
     // Re-render the whole in-progress message through the canonical renderer,
     // replacing our previous render. Debounced to coalesce token bursts.
     let rerenderTimer = null;
@@ -3169,6 +3197,7 @@ import createResearchSynapse from './researchSynapse.js';
       rerenderTimer = null;
       if (sessionModule.getCurrentSessionId() !== sessionId) return;
       killPlaceholder();
+      removeThinking();  // keep the spinner below freshly-rendered content (bump re-adds it)
       box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
       const before = new Set(Array.from(box.children));
       const md = { model, timestamp: Date.now() };
@@ -3210,12 +3239,16 @@ import createResearchSynapse from './researchSynapse.js';
             else if (thinkOpen) { d = '</think>' + d; thinkOpen = false; }
             addText(d);
             scheduleRerender();
+            bumpThinking();
           } else if (json.type === 'agent_step') {
             if (thinkOpen) { addText('</think>'); thinkOpen = false; }
             if (typeof json.round === 'number' && json.round > 0) curRound = json.round - 1;
+            bumpThinking();   // new round — LLM is generating again
           } else if (json.type === 'tool_start') {
+            _lastTool = json.tool || _lastTool;
             tool_events.push({ round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '', output: '', exit_code: null, _pending: true });
             scheduleRerender();
+            bumpThinking();
           } else if (json.type === 'tool_output') {
             // Fill the matching pending tool node (or push if we missed its start).
             let ev = null;
@@ -3225,6 +3258,7 @@ import createResearchSynapse from './researchSynapse.js';
             if (!ev) { ev = { round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '' }; tool_events.push(ev); }
             ev.output = json.output || ''; ev.exit_code = json.exit_code; ev._pending = false;
             scheduleRerender();
+            bumpThinking();   // tool done — LLM will generate the next response
           } else if (json.type === 'doc_stream_open' && documentModule) {
             try { documentModule.streamDocOpen(json.title || '', json.language || ''); } catch (_) {}
           } else if (json.type === 'doc_stream_delta' && documentModule) {
@@ -3236,6 +3270,8 @@ import createResearchSynapse from './researchSynapse.js';
       // fall through to finalize
     } finally {
       if (rerenderTimer) { clearTimeout(rerenderTimer); rerenderTimer = null; }
+      if (thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
+      removeThinking();
       // Flush a final render — when the backlog + [DONE] arrive in one burst the
       // debounced timer would otherwise be cancelled here before it ever fired.
       try { doRerender(); } catch (_) {}
