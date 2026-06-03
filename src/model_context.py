@@ -330,8 +330,8 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
 
     # Try llama.cpp /slots endpoint first — reports actual serving context
     if is_local_endpoint(endpoint_url):
+        base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
         try:
-            base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
             r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
             if r.is_success:
                 slots = r.json()
@@ -340,6 +340,24 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
                     if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
                         logger.info(f"llama.cpp /slots reports n_ctx={n_ctx} for {model}")
                         return n_ctx, True
+        except Exception:
+            pass
+        # LM Studio's native REST API reports the ACTUAL loaded context window,
+        # which its OpenAI-compatible /v1/models does not. `loaded_context_length`
+        # is the real serving limit (often set below `max_context_length` to save
+        # VRAM); using it prevents us from packing past what the server holds and
+        # having it silently truncate the oldest messages.
+        try:
+            r = httpx.get(f"{base}/api/v0/models", timeout=REQUEST_TIMEOUT)
+            if r.is_success:
+                for m in (r.json().get("data") or []):
+                    mid = m.get("id", "")
+                    if mid == model or mid.split("/")[-1] == model.split("/")[-1]:
+                        loaded = m.get("loaded_context_length")
+                        if loaded and isinstance(loaded, int) and loaded > 0:
+                            logger.info(f"LM Studio reports loaded_context_length={loaded} for {model}")
+                            return loaded, True
+                        break
         except Exception:
             pass
 
