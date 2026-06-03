@@ -8,11 +8,7 @@ import shutil
 from typing import Optional, Dict, Any, Tuple
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
-
-# Default number of lines a single read_file call returns when the model doesn't
-# ask for a specific window. Line-based pagination (offset/limit) lets it walk a
-# large file without ever re-reading the same head.
-DEFAULT_READ_LINES = 500
+from src.pagination import paginate_lines
 
 _CODENAV_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "__pycache__",
@@ -160,8 +156,8 @@ class ReadFileTool:
         try:
             def _read():
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.readlines()
-            lines = await asyncio.to_thread(_read)
+                    return f.read()
+            text = await asyncio.to_thread(_read)
         except FileNotFoundError:
             return {"error": f"read_file: {path}: not found", "exit_code": 1}
         except PermissionError:
@@ -170,35 +166,18 @@ class ReadFileTool:
             return {"error": f"read_file: {path}: is a directory (use ls)", "exit_code": 1}
         except OSError as e:
             return {"error": f"read_file: {path}: {e}", "exit_code": 1}
-        total = len(lines)
-        # 1-based start line; limit<=0 means "default page size".
-        start = max(1, offset)
-        page = limit if limit > 0 else DEFAULT_READ_LINES
-        window = lines[start - 1:start - 1 + page]
-        # Char safety net: stop at the last whole line that fits MAX_READ_CHARS
-        # (one runaway long line is hard-cut so we always make progress).
-        out, chars = [], 0
-        for ln in window:
-            if out and chars + len(ln) > MAX_READ_CHARS:
-                break
-            if not out and len(ln) > MAX_READ_CHARS:
-                ln = ln[:MAX_READ_CHARS]
-            out.append(ln)
-            chars += len(ln)
-        shown = len(out)
-        last = start - 1 + shown  # last line number actually returned
-        data = "".join(out)
+        # Line-based pagination, shared with manage_documents read (src/pagination).
+        pg = paginate_lines(text, offset, limit)
+        data, start, last, total = pg["data"], pg["start"], pg["last"], pg["total"]
         # Self-describing cursor: tell the model exactly how to continue, so a
         # forgetful model never has to remember where it stopped.
-        if start > total and total > 0:
-            data = (data + f"\n... [offset {start} is past end of file "
-                    f"({total} lines total)]")
-        elif last < total:
-            data = (data + f"\n... [showing lines {start}-{last} of {total}; "
-                    f"more remains — call read_file again with offset={last + 1} "
-                    f"to continue]")
+        if pg["past_eof"]:
+            data += f"\n... [offset {start} is past end of file ({total} lines total)]"
+        elif pg["has_more"]:
+            data += (f"\n... [showing lines {start}-{last} of {total}; more remains "
+                     f"— call read_file again with offset={last + 1} to continue]")
         elif start > 1:
-            data = data + f"\n... [end of file — lines {start}-{total} of {total}]"
+            data += f"\n... [end of file — lines {start}-{total} of {total}]"
         return {"output": data, "exit_code": 0}
 
 class WriteFileTool:

@@ -759,8 +759,8 @@ FUNCTION_TOOL_SCHEMAS = [
                     "title": {"type": "string", "description": "Alternative to document_id for action='read': match a document by title (exact or partial)."},
                     "search": {"type": "string", "description": "Search query (for list)"},
                     "language": {"type": "string", "description": "Filter by language (for list)"},
-                    "limit": {"type": "integer", "description": "Max results for list (default 50), OR max characters returned for read (default 20000)."},
-                    "offset": {"type": "integer", "description": "For read: start at this character offset (default 0). If a read is truncated it returns next_offset — call read again with offset=next_offset to continue."}
+                    "limit": {"type": "integer", "description": "Max results for list (default 50), OR max LINES returned for read (default 500)."},
+                    "offset": {"type": "integer", "description": "For read: 1-based start LINE (default 1). If a read is truncated the result says 'call read again with offset=N' — use that N to continue. Same line-based semantics as read_file."}
                 },
                 "required": ["action"]
             }
