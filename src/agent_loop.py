@@ -1246,6 +1246,7 @@ _VERIFIER_EFFECTFUL_TOOLS = {
 }
 _VERIFIER_MAX_ROUNDS = 2  # cap re-verify cycles per turn — never loop forever
 _MAX_INTENT_NUDGES = 1  # cap "announced an action but emitted no tool call" re-prompts per turn
+_MAX_EMPTY_AFTER_TOOL_NUDGES = 1  # cap "fell silent after tool output" re-prompts per turn
 # Forward-looking first-person phrasing signalling the model intends to act
 # NEXT — used to catch a "preamble" round that emitted no tool call and would
 # otherwise be misread as a finished answer.
@@ -1586,6 +1587,7 @@ async def stream_agent_loop(
     _effectful_used = False
     _verifier_rounds = 0
     _intent_nudges = 0  # trailed-off-intent guard: re-prompts used this turn
+    _empty_after_tool_nudges = 0  # empty-round-after-tool guard: re-prompts used this turn
     _verifier_instruction = _extract_last_user_message(messages)
     real_input_tokens = 0   # Accumulated real usage from API
     real_output_tokens = 0
@@ -1991,6 +1993,37 @@ async def stream_agent_loop(
                         "now. If the task is already complete, just stop — a plain "
                         "final answer with no tool call is perfectly fine and you do "
                         "not need to take any further action."
+                    ),
+                })
+                continue
+
+            # ── Empty-round-after-tool guard ──────────────────────────
+            # A round with NO text and NO tool call, after a tool already ran
+            # this turn, means the model fell silent on the follow-up instead
+            # of summarizing the result — common on weak local models, which
+            # often emit nothing once tool output lands. The bare break would
+            # end the turn leaving the user with tool bubbles and no answer:
+            # the end-of-loop empty-response fallback is disabled once any
+            # tool has run (`... or tool_events`), so nothing else catches it.
+            # (`_intent_text` is the think-stripped round text, computed above;
+            # the trailed-off guard only fires when it is NON-empty, so an
+            # empty round falls straight through to here.) Nudge once to use
+            # the results or continue; capped, skipped on force-answer rounds.
+            if (not _intent_text and tool_events and not _force_answer
+                    and _empty_after_tool_nudges < _MAX_EMPTY_AFTER_TOOL_NUDGES):
+                _empty_after_tool_nudges += 1
+                logger.info(
+                    f"[agent] empty round {round_num} after tool output; "
+                    f"nudging once to summarize or continue."
+                )
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The tool results above are now available, but your last "
+                        "message was empty. Use those results to answer the user's "
+                        "request now, or make another tool call if more work is "
+                        "needed. Do not reply with an empty message."
                     ),
                 })
                 continue
