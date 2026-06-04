@@ -127,6 +127,21 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # ── Sampling knobs for SELF-HOSTED models (LM Studio / llama.cpp / vLLM) ──
+    # Sent only to self-hosted OpenAI-compatible endpoints; managed clouds
+    # (OpenAI, OpenRouter, …) are left untouched. These fight the repetition /
+    # looping that weak local finetunes fall into when sampled greedily. Set a
+    # knob to null/blank to omit it. Defaults follow the Qwen vendor card
+    # (top_p 0.8, top_k 20) plus a mild presence_penalty (Qwen's recommended
+    # anti-repetition knob; high values cause language-mixing, so 0.5).
+    # frequency_penalty (0.0) and repeat_penalty (1.0) are no-ops by default —
+    # available to retune without stacking. See src/llm_core._apply_local_sampling.
+    "local_sampling_enabled": True,
+    "sampling_top_p": 0.8,
+    "sampling_top_k": 20,
+    "sampling_presence_penalty": 0.5,
+    "sampling_frequency_penalty": 0.0,
+    "sampling_repeat_penalty": 1.0,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
