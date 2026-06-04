@@ -172,7 +172,7 @@ async def maybe_extract_skill(
         import time as _time
         _t0 = _time.monotonic()
         logger.debug(
-            "[skill-extract] calling LLM (endpoint=%s, ctx=%d msgs, timeout=30s)",
+            "[skill-extract] calling LLM (endpoint=%s, ctx=%d msgs, timeout=120s)",
             endpoint_url, len(recent),
         )
         response = await llm_call_async(
@@ -183,7 +183,11 @@ async def maybe_extract_skill(
                 {"role": "user", "content": f"Conversation:\n{conversation}"},
             ],
             headers=headers,
-            timeout=30,
+            # Slow self-hosted models routinely need >30s for this background
+            # extraction; the old 30s cap failed constantly (and each doomed
+            # call still loaded the backend, contending with live chat). Match
+            # the memory extractor's 120s bound.
+            timeout=120,
         )
         logger.debug(
             "[skill-extract] LLM returned in %.1fs (len=%d, head=%r)",
