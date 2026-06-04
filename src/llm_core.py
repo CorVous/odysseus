@@ -681,6 +681,66 @@ def _restricts_temperature(model: str) -> bool:
     m = model.lower()
     return any(m.startswith(p) or f"/{p}" in m for p in _FIXED_TEMPERATURE_MODELS)
 
+# ── Local-model sampling knobs ───────────────────────────────────────────────
+# Weak self-hosted finetunes (e.g. a Qwen3-MoE heretic served from LM Studio)
+# loop and repeat themselves when sampled greedily, but we only ever sent
+# `temperature` + `max_tokens` — never the anti-repetition knobs the backend
+# supports. llama.cpp / LM Studio / vLLM accept them over the OpenAI-compatible
+# API; managed clouds (OpenAI, OpenRouter, …) 400 on the llama.cpp-only ones, so
+# we apply the whole set ONLY to self-hosted endpoints and leave hosted-model
+# payloads byte-identical to before. Each knob is a setting (see DEFAULT_SETTINGS
+# `sampling_*`), so an operator can retune or disable any of them; defaults track
+# the Qwen vendor card (top_p 0.8, top_k 20) plus a mild presence_penalty (Qwen's
+# recommended anti-repetition knob — high values cause language-mixing, so 0.5).
+_CLOUD_HOST_MARKERS = (
+    "anthropic.com", "openai.com", "azure.com", "x.ai", "mistral.ai",
+    "deepseek.com", "googleapis.com", "together.xyz", "together.ai",
+    "fireworks.ai", "openrouter.ai", "groq.com", "perplexity.ai",
+    "cohere.ai", "cohere.com",
+)
+
+def _is_selfhosted_endpoint(url: str) -> bool:
+    """True for self-hosted OpenAI-compatible endpoints (LM Studio, llama.cpp,
+    vLLM, …) — anything whose host is not a known managed cloud provider."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return bool(host) and not any(m in host for m in _CLOUD_HOST_MARKERS)
+
+# (payload key, settings key, caster) — only sent when the setting is non-null.
+_LOCAL_SAMPLING_PARAMS = (
+    ("top_p", "sampling_top_p", float),
+    ("top_k", "sampling_top_k", int),
+    ("presence_penalty", "sampling_presence_penalty", float),
+    ("frequency_penalty", "sampling_frequency_penalty", float),
+    ("repeat_penalty", "sampling_repeat_penalty", float),
+)
+
+def _apply_local_sampling(payload: dict, model: str, url: str) -> None:
+    """Inject anti-repetition sampling knobs into a self-hosted OpenAI payload.
+
+    No-op for managed clouds, for reasoning models that reject sampling params,
+    or when `local_sampling_enabled` is off — so existing hosted/cloud behaviour
+    is untouched. A knob whose setting is null/blank is simply omitted.
+    """
+    if _restricts_temperature(model) or not _is_selfhosted_endpoint(url):
+        return
+    try:
+        from src.settings import get_setting
+    except Exception:
+        return
+    if not get_setting("local_sampling_enabled", True):
+        return
+    for payload_key, setting_key, cast in _LOCAL_SAMPLING_PARAMS:
+        val = get_setting(setting_key, None)
+        if val is None or val == "":
+            continue
+        try:
+            payload[payload_key] = cast(val)
+        except (TypeError, ValueError):
+            continue
+
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = ("qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax", "m2-reap", "gemma")
 
@@ -1210,6 +1270,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        _apply_local_sampling(payload, model, url)
     try:
         note_model_activity(target_url, model)
         r = httpx.post(target_url, headers=h, json=payload, timeout=timeout)
@@ -1408,6 +1469,7 @@ async def llm_call_async(
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_sampling(payload, model, url)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -1531,6 +1593,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_sampling(payload, model, url)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
             from src.copilot import apply_request_headers
