@@ -3201,11 +3201,48 @@ import createResearchSynapse from './researchSynapse.js';
     // Re-render the whole in-progress message through the canonical renderer,
     // replacing our previous render. Debounced to coalesce token bursts.
     let rerenderTimer = null;
+    let lastThinkSecCount = 0;   // # of thinking sections last render — a jump means a new round started streaming
+    // Expand/collapse a thinking section fully (content + chevron + label) so a
+    // reapplied state is indistinguishable from a user click. The old force-expand
+    // flipped only `.thinking-content`, leaving the chevron and "View thinking"
+    // label stale.
+    const applyThinkExpanded = (sec, expanded) => {
+      if (!sec) return;
+      const content = sec.querySelector('.thinking-content');
+      const header = sec.querySelector('.thinking-header[data-thinking-id]');
+      const id = header && header.dataset.thinkingId;
+      const toggle = id ? document.getElementById(id + '-toggle') : null;
+      if (content) content.classList.toggle('expanded', expanded);
+      if (toggle) toggle.classList.toggle('expanded', expanded);
+      const lbl = header && header.querySelector('.thinking-header-left span');
+      if (lbl) { const l = lbl.dataset.label || 'thinking process'; lbl.textContent = (expanded ? 'Hide ' : 'View ') + l; }
+    };
     const doRerender = () => {
       rerenderTimer = null;
       if (sessionModule.getCurrentSessionId() !== sessionId) return;
       killPlaceholder();
       removeThinking();  // keep the spinner below freshly-rendered content (bump re-adds it)
+
+      // We tear down and rebuild the whole in-progress turn each tick, which
+      // discards two pieces of view state we have to restore by hand:
+      //  1. Which thinking sections the user expanded/collapsed — captured by
+      //     document order (rounds only ever get appended, so earlier indices
+      //     stay aligned) and reapplied after the rebuild.
+      //  2. Scroll position. Removing the turn collapses scrollHeight, which
+      //     clamps scrollTop upward (the view snaps to the last user message);
+      //     uiModule.scrollHistory()'s "user scrolled up" guard (>300px) then
+      //     refuses to recover for any turn taller than 300px. So we record
+      //     whether the user was parked at the bottom and re-pin deterministically.
+      const prevSecs = box.querySelectorAll('.resume-rendered .thinking-section');
+      const expandedIdx = new Set();
+      prevSecs.forEach((sec, i) => {
+        const c = sec.querySelector('.thinking-content');
+        if (c && c.classList.contains('expanded')) expandedIdx.add(i);
+      });
+      const autoScroll = !uiModule.getAutoScroll || uiModule.getAutoScroll();
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 120;
+      const prevTop = box.scrollTop;
+
       box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
       const before = new Set(Array.from(box.children));
       // While a <think> block is still streaming (no </think> yet), close it just
@@ -3223,13 +3260,22 @@ import createResearchSynapse from './researchSynapse.js';
         }
       } catch (_) { /* keep streaming even if a render hiccups */ }
       Array.from(box.children).forEach((c) => { if (!before.has(c)) c.classList.add('resume-rendered'); });
-      // Keep the still-streaming thinking section expanded (matches the live view,
-      // which shows thinking open while it streams, then collapses when done).
-      if (thinkOpen) {
-        const tcs = box.querySelectorAll('.resume-rendered .thinking-content');
-        if (tcs.length) tcs[tcs.length - 1].classList.add('expanded');
-      }
-      uiModule.scrollHistory();
+
+      // Reapply the user's expand/collapse choices by document order.
+      const newSecs = box.querySelectorAll('.resume-rendered .thinking-section');
+      newSecs.forEach((sec, i) => { if (expandedIdx.has(i)) applyThinkExpanded(sec, true); });
+      // Auto-open a thinking section the first tick it appears (matches the live
+      // view, which shows each round's thinking open while it streams). We key off
+      // the section count growing rather than force-expanding the last box every
+      // tick, so a user collapse sticks instead of snapping back open.
+      if (thinkOpen && newSecs.length > lastThinkSecCount) applyThinkExpanded(newSecs[newSecs.length - 1], true);
+      lastThinkSecCount = newSecs.length;
+
+      // Restore scroll: re-pin to the bottom if the user was parked there (instant,
+      // bypassing scrollHistory's scrolled-up guard); otherwise hold their reading
+      // position rather than letting the teardown yank it to the last user message.
+      if (autoScroll && nearBottom) box.scrollTop = box.scrollHeight;
+      else box.scrollTop = prevTop;
     };
     const scheduleRerender = () => { if (!rerenderTimer) rerenderTimer = setTimeout(doRerender, 140); };
 

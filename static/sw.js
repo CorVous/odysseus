@@ -14,7 +14,9 @@
 // wiped the resume bubble); resume is driven solely by sessions._checkServerStream.
 // v329-v332: parity render, no-flash, per-round spinner, expanded in-progress think.
 // v336: resume reattach restores the Stop button.
-const CACHE_NAME = 'odysseus-v336';
+// v339: resume rerender preserves scroll (no more snap to last user message) and
+// thinking expand/collapse state (no more wrong-box / every-tick force-expand).
+const CACHE_NAME = 'odysseus-v339';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
