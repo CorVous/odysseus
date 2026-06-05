@@ -64,6 +64,72 @@ def _spawn_bg(coro) -> asyncio.Task:
     return task
 
 
+# ── Cross-turn tool-result replay ──────────────────────────────────────── #
+
+def _format_tool_recap(events: list, char_budget: int) -> str:
+    """Compact ``[tool] command (exit N) -> output-head`` lines from saved
+    tool_events, kept under ``char_budget`` (≈4 chars/token). Each output head
+    is capped so one huge event can't crowd out the rest of the turn."""
+    lines = []
+    used = 0
+    for ev in events or []:
+        if used >= char_budget:
+            break
+        tool = ev.get("tool", "?")
+        cmd = (ev.get("command") or "").strip()
+        out = (ev.get("output") or "").strip()
+        rc = ev.get("exit_code")
+        head = f"[{tool}] {cmd}" if cmd else f"[{tool}]"
+        rc_s = f" (exit {rc})" if rc not in (None, 0) else ""
+        body = out if len(out) <= 1000 else out[:1000] + " …"
+        entry = f"{head}{rc_s}\n-> {body or '(no output)'}"
+        if used + len(entry) > char_budget:
+            entry = entry[: max(0, char_budget - used)].rstrip()
+            if entry:
+                lines.append(entry)
+            break
+        lines.append(entry)
+        used += len(entry) + 2
+    return "\n".join(lines)
+
+
+def _inject_recent_tool_results(messages: list, max_turns: int, token_budget: int) -> None:
+    """Fold recent turns' tool RESULTS into the agent's context, in place.
+
+    For the most recent ``max_turns`` assistant messages that carry saved
+    ``tool_events`` (newest first), append a compact record of what they ran +
+    returned to that message's ``content``, bounded by ``token_budget`` total.
+    Folded into the existing assistant message (not separate tool messages) so it
+    can never violate the provider's tool_use/tool_result pairing rule. Only the
+    per-request ``messages`` copies are mutated — saved history / display are
+    untouched. No-op when disabled (turns/budget <= 0) or in chat mode (no
+    tool_events). Note: replays the ≤2k-char output heads saved at turn time, not
+    untruncated results (Odysseus doesn't persist those)."""
+    if max_turns <= 0 or token_budget <= 0:
+        return
+    spent_chars = 0
+    char_budget = token_budget * 4
+    turns_done = 0
+    for msg in reversed(messages):
+        if turns_done >= max_turns or spent_chars >= char_budget:
+            break
+        if msg.get("role") != "assistant":
+            continue
+        events = (msg.get("metadata") or {}).get("tool_events")
+        if not events:
+            continue
+        turns_done += 1
+        recap = _format_tool_recap(events, char_budget - spent_chars)
+        if not recap:
+            continue
+        block = (
+            "\n\n[Tool results from this turn — you already ran these; continue "
+            "from them, don't repeat the work:]\n" + recap
+        )
+        msg["content"] = (msg.get("content") or "") + block
+        spent_chars += len(block)
+
+
 # ── Data containers ────────────────────────────────────────────────────── #
 
 @dataclass
@@ -711,6 +777,19 @@ async def build_chat_context(
                 messages.append(_dt_msg)
         except Exception:
             logger.debug("Failed to add current date/time context", exc_info=True)
+    # Replay recent turns' tool RESULTS into the agent's context. Normally only
+    # each assistant turn's final prose carries forward (get_context_messages
+    # feeds `content` only; tool_events are saved for DISPLAY, never replayed),
+    # so on a follow-up the model can't see what it already ran and redoes work.
+    # Fold the saved tool_events from the most recent N turns back into those
+    # messages — bounded by a token budget, newest-first — so it continues from
+    # what it did. Sliding-window over recent turns + summary-tier (older turns
+    # stay as plain prose) is the mainstream pattern for context-limited models.
+    if agent_mode:
+        from src.settings import get_setting
+        _replay_turns = int(get_setting("agent_tool_result_replay_turns", 2) or 0)
+        _replay_budget = int(get_setting("agent_tool_result_replay_token_budget", 6000) or 0)
+        _inject_recent_tool_results(messages, _replay_turns, _replay_budget)
 
     # Auto-compact
     messages, context_length, was_compacted = await maybe_compact(
