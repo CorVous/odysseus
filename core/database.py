@@ -384,6 +384,11 @@ class ModelEndpoint(TimestampMixin, Base):
     # can be toggled per-endpoint in the UI. NULL = unknown, falls
     # back to the model-name keyword heuristic in agent_loop.py.
     supports_tools = Column(Boolean, nullable=True, default=None)
+    # OpenRouter-only: the `provider` routing object sent in the chat-completion
+    # body (e.g. {"order": ["DeepInfra"], "allow_fallbacks": false, "sort":
+    # "throughput"}). Stored as a JSON string; ignored for non-OpenRouter
+    # endpoints. NULL = let OpenRouter pick the upstream provider (default).
+    provider_routing = Column(Text, nullable=True)
     # Per-user ownership. NULL = legacy/shared (visible to every user) — this
     # is the historical default. When non-null, the model picker only shows
     # the endpoint to that user (admins always see everything).
@@ -997,6 +1002,25 @@ def _migrate_add_supports_tools_column():
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_add_provider_routing_column():
+    """Add provider_routing column to model_endpoints if it doesn't exist."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(model_endpoints)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "provider_routing" not in columns:
+            conn.execute("ALTER TABLE model_endpoints ADD COLUMN provider_routing TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'provider_routing' column to model_endpoints")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"provider_routing migration failed: {e}")
 
 
 def _migrate_add_cached_models_column():
@@ -1803,6 +1827,7 @@ def init_db():
     _migrate_add_model_endpoint_owner_column()
     _migrate_add_provider_auth_id_column()
     _migrate_add_supports_tools_column()
+    _migrate_add_provider_routing_column()
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
