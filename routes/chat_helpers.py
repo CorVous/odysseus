@@ -220,9 +220,17 @@ async def auto_name_session(session_manager, sess):
                 {"role": "user", "content": first_msg},
             ],
             temperature=0.3,
-            max_tokens=4096,
+            # A 3-6 word title needs little room; the headroom is only so a
+            # reasoning model can emit + close its <think> block first. 4096
+            # let a slow local model burn ~100s generating, foreground, on the
+            # single LM Studio slot — stalling the live turn. 1024 is plenty.
+            max_tokens=1024,
             headers=t_headers,
             timeout=60,
+            # Background: yield the single self-hosted slot to the live chat
+            # turn so naming never pauses the user's response. See
+            # _serialize_endpoint.
+            background=True,
         )
 
         title = title.strip().strip('"\'').strip()
