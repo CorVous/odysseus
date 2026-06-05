@@ -1487,6 +1487,7 @@ class TaskScheduler:
                 fallback_model=model,
                 owner=task.owner,
                 timeout=120,
+                background=True,
             )
 
         # Strip the model's chain-of-thought before saving/delivering. Task

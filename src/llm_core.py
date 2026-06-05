@@ -1,6 +1,7 @@
 # src/llm_core.py
 import httpx
 import asyncio
+import contextlib
 import time
 import json
 import logging
@@ -968,6 +969,78 @@ def _apply_local_sampling(payload: dict, model: str, url: str) -> None:
             continue
 
 
+# ── Single-slot serialization for self-hosted endpoints ──────────────────────
+# LM Studio (and similar single-GPU llama.cpp servers) process ONE request at a
+# time. When a background job (skill/memory extraction, a scheduled audit) fires
+# while a chat is streaming, both hit the one slot and the loser stalls → 502s
+# and spurious client timeouts. We serialize async calls per host so the backend
+# only ever sees one at a time, and let foreground (chat/agent) calls take the
+# slot ahead of background ones.
+#
+# SAFETY: acquisition is BOUNDED. If the slot can't be taken within the window we
+# proceed UNGATED (and log it) rather than block forever — so a leaked/wedged
+# slot degrades to today's behaviour, never a permanent deadlock on chat. Applies
+# only to self-hosted endpoints (cloud APIs serve requests in parallel).
+_SLOT_FG_MAX_WAIT = 330.0   # foreground: just over STREAM_TIMEOUT (one legit hold)
+_SLOT_BG_MAX_WAIT = 330.0   # background: yields to foreground, then serializes
+_SLOT_QUIET_SECONDS = 15.0  # background also yields while a turn is mid-flight
+                            # (model used < this many seconds ago, e.g. between
+                            # an agent's tool-execution gaps)
+
+class _EndpointSlot:
+    __slots__ = ("lock", "fg_inflight")
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.fg_inflight = 0   # foreground requests currently holding/seeking the slot
+
+_endpoint_slots: Dict[str, _EndpointSlot] = {}
+_endpoint_slots_guard = threading.Lock()
+
+def _slot_for(url: str) -> _EndpointSlot:
+    key = _host_key(url)
+    with _endpoint_slots_guard:
+        slot = _endpoint_slots.get(key)
+        if slot is None:
+            slot = _endpoint_slots[key] = _EndpointSlot()
+        return slot
+
+@contextlib.asynccontextmanager
+async def _serialize_endpoint(url: str, model: str = "", *, background: bool = False):
+    """One-at-a-time gate for a single-slot self-hosted endpoint. No-op for cloud
+    endpoints. Foreground takes priority; background yields to active foreground
+    and to a brief post-activity quiet window. Bounded — degrades to ungated."""
+    if not _is_selfhosted_endpoint(url):
+        yield
+        return
+    slot = _slot_for(url)
+    max_wait = _SLOT_BG_MAX_WAIT if background else _SLOT_FG_MAX_WAIT
+    deadline = time.time() + max_wait
+    # Background yields to any active/pending foreground and to a turn mid-flight.
+    if background:
+        while time.time() < deadline:
+            recent = seconds_since_model_activity(url, model)
+            if slot.fg_inflight == 0 and (recent is None or recent >= _SLOT_QUIET_SECONDS):
+                break
+            await asyncio.sleep(0.25)
+    if not background:
+        slot.fg_inflight += 1
+    acquired = False
+    try:
+        try:
+            await asyncio.wait_for(slot.lock.acquire(),
+                                   timeout=max(0.1, deadline - time.time()))
+            acquired = True
+        except asyncio.TimeoutError:
+            logger.warning("[slot] %s busy > %.0fs; proceeding ungated (%s)",
+                           _host_key(url), max_wait, "bg" if background else "fg")
+        yield
+    finally:
+        if acquired:
+            slot.lock.release()
+        if not background and slot.fg_inflight > 0:
+            slot.fg_inflight -= 1
+
+
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = (
     "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax",
@@ -1591,7 +1664,16 @@ async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
 
 
-async def llm_call_async(
+async def llm_call_async(url, *args, background: bool = False, **kwargs):
+    """Serialized wrapper around the real async call. For a single-slot
+    self-hosted endpoint, `background=True` callers (skill/memory extraction,
+    scheduled audits) yield the slot to foreground chat; cloud endpoints are
+    unaffected. See _serialize_endpoint."""
+    model = kwargs.get("model", args[0] if args else "")
+    async with _serialize_endpoint(url, model, background=background):
+        return await _llm_call_async_impl(url, *args, **kwargs)
+
+async def _llm_call_async_impl(
     url: str,
     model: str,
     messages: List[Dict],
@@ -1757,7 +1839,17 @@ async def llm_call_async(
                 raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
 
-async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
+async def stream_llm(url, *args, background: bool = False, **kwargs):
+    """Serialized wrapper around the streaming call. Holds the single slot for
+    the whole stream on a self-hosted endpoint so a background job can't collide
+    with it mid-generation; released deterministically when the stream finishes
+    or the consumer closes the generator. Cloud endpoints stream unguarded."""
+    model = kwargs.get("model", args[0] if args else "")
+    async with _serialize_endpoint(url, model, background=background):
+        async for chunk in _stream_llm_impl(url, *args, **kwargs):
+            yield chunk
+
+async def _stream_llm_impl(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None):

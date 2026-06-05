@@ -365,6 +365,8 @@ async def extract_and_store(
                 # enough once thinking has room.
                 max_tokens=4096,
                 headers=headers,
+                # Background job: yield the single LM Studio slot to live chat.
+                background=True,
             )
 
             # Parse JSON, tolerating reasoning-model noise (<think> blocks, a
@@ -552,6 +554,8 @@ async def audit_memories(
             # Bound the call so the Tidy whirlpool can't spin indefinitely on a
             # slow/large generation.
             timeout=120,
+            # Background job: yield the single LM Studio slot to live chat.
+            background=True,
         )
 
         # Parse the JSON list, tolerating reasoning-model noise: <think> blocks,
