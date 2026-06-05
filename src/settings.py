@@ -111,6 +111,11 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget` in src/context_budget.py.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # How many times to transparently re-run an agent round whose stream dies
+    # BEFORE emitting any token (a single-slot backend stalling/502ing with no
+    # fallback endpoint). Keeps a transient error from killing the turn and making
+    # the model restart its work next turn. 0 disables. See _stream_round_with_retry.
+    "agent_round_retry_max": 2,
     # ── Sampling knobs for SELF-HOSTED models (LM Studio / llama.cpp / vLLM) ──
     # Sent only to self-hosted OpenAI-compatible endpoints; managed clouds
     # (OpenAI, OpenRouter, …) are left untouched. These fight the repetition /

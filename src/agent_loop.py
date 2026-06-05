@@ -1704,6 +1704,44 @@ def _detect_runaway_call(call_freq, threshold=15):
     """
     sig = next((s for s, n in call_freq.items() if n >= threshold), None)
     return sig.split(":", 1)[0] if sig else None
+# Pre-content retry for a single agent round. A weak single-slot backend (e.g.
+# LM Studio) sometimes stalls / 502s BEFORE emitting any token; with no fallback
+# endpoint configured, that error otherwise kills the round — the turn ends and
+# the model restarts the work next turn ("forgets what it just did after the
+# error"). Here we transparently re-run the round's stream on a PRE-CONTENT error
+# so a transient stall is invisible and the turn continues from its accumulated
+# context. Once real content / tool-calls have streamed (we can't un-send them),
+# errors pass through unchanged — matching stream_llm_with_fallback's own
+# pre-content-only switch policy. Abandoning a stream mid-iteration closes it,
+# which releases the serialization slot before the retry re-acquires a fresh one.
+_ROUND_RETRY_BACKOFF = 1.5  # seconds, scaled by attempt number
+
+async def _stream_round_with_retry(candidates, messages, *, max_retries=2, **kwargs):
+    attempt = 0
+    while True:
+        produced = False      # have we streamed anything the client renders yet?
+        retry_err = None
+        async for chunk in stream_llm_with_fallback(candidates, messages, **kwargs):
+            if chunk.startswith("event: error"):
+                if not produced and attempt < max_retries:
+                    retry_err = chunk
+                    break     # abandon this attempt; retry the whole round
+                yield chunk    # mid-stream error, or out of retries: surface it
+                continue
+            # `"delta"` (quoted) is the text key — does NOT match tool_call's
+            # `"arg_delta"`; tool calls and doc streaming are visible content too.
+            if ('"delta"' in chunk) or ('"tool_call' in chunk) or ('doc_stream' in chunk):
+                produced = True
+            yield chunk
+        if retry_err is not None:
+            attempt += 1
+            logger.warning(
+                "[agent] round stream failed pre-content; retry %d/%d after %.1fs",
+                attempt, max_retries, _ROUND_RETRY_BACKOFF * attempt,
+            )
+            await asyncio.sleep(_ROUND_RETRY_BACKOFF * attempt)
+            continue
+        return
 
 
 async def stream_agent_loop(
@@ -2089,6 +2127,10 @@ async def stream_agent_loop(
     )
     _awaiting_user = False  # set by ask_user → end the turn and wait for a choice
 
+    # Transparent retries for a round whose stream dies BEFORE any token — keeps
+    # a transient single-slot stall from killing the turn (see _stream_round_with_retry).
+    _round_retry_max = int(get_setting("agent_round_retry_max", 2) or 0)
+
     # Document streaming state (persists across rounds)
     _doc_acc = ""          # accumulated tool-call JSON arguments
     _doc_opened = False    # whether doc_stream_open was sent
@@ -2164,9 +2206,10 @@ async def stream_agent_loop(
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
         _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
-        async for chunk in stream_llm_with_fallback(
+        async for chunk in _stream_round_with_retry(
             _candidates,
             messages,
+            max_retries=_round_retry_max,
             temperature=temperature,
             max_tokens=max_tokens,
             prompt_type=prompt_type if round_num == 1 else None,
