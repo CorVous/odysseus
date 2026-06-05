@@ -39,6 +39,19 @@ from src.agent_tools import (
 logger = logging.getLogger(__name__)
 
 
+def _aux_timeout() -> int:
+    """Timeout (s) for the agent's non-streaming auxiliary calls (grace
+    synthesis, completion verifier). These run on the same — possibly slow,
+    local — model as chat; a hard 60s used to kill the salvage path on models
+    whose p90 latency exceeds it, so a turn would do all its tool work and then
+    die with no answer. Tunable via the `agent_aux_timeout` setting."""
+    try:
+        v = int(get_setting("agent_aux_timeout", 240) or 240)
+        return v if v > 0 else 240
+    except (TypeError, ValueError):
+        return 240
+
+
 def _load_mcp_disabled_map() -> Dict[str, set]:
     """Load per-server disabled tool sets from the database."""
     from core.database import McpServer, SessionLocal
@@ -1832,7 +1845,7 @@ async def _run_verifier_subagent(
         raw = await llm_call_async(
             url=endpoint_url, model=model,
             messages=[{"role": "user", "content": prompt}],
-            headers=headers, temperature=0.0, max_tokens=600, timeout=60,
+            headers=headers, temperature=0.0, max_tokens=600, timeout=_aux_timeout(),
         )
     except Exception as e:
         logger.warning(f"[agent] verifier subagent failed: {e}")
@@ -2818,7 +2831,7 @@ async def stream_agent_loop(
                     }]
                     _raw = await llm_call_async(
                         url=endpoint_url, model=model, messages=_synth_messages,
-                        headers=headers, temperature=0.3, max_tokens=max_tokens, timeout=60,
+                        headers=headers, temperature=0.3, max_tokens=max_tokens, timeout=_aux_timeout(),
                     )
                     _synth = _THINK_RE.sub("", strip_tool_blocks(_raw or "")).strip()
                 except Exception as _e:

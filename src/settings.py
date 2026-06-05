@@ -127,6 +127,14 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Timeout (seconds) for the NON-streaming auxiliary LLM calls the agent
+    # makes on the same model as chat: grace synthesis (the salvage that writes
+    # a final answer when the loop-breaker trips) and the completion verifier.
+    # The old hard-coded 60s killed these on slow/local models whose normal
+    # latency exceeds it (e.g. a 35B running locally with p90 ~90s), so a turn
+    # would do all its tool work and then die with no answer. Raise for slow
+    # backends, lower for fast cloud APIs.
+    "agent_aux_timeout": 240,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
