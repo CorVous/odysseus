@@ -327,8 +327,15 @@ export function extractThinkingBlocks(text) {
 /**
  * Create a collapsible thinking section
  */
+let _thinkSeq = 0;
 function createThinkingSection(thinkingContent, index = 0, thinkingTime = null) {
-  const id = `thinking-${Date.now()}-${index}`;
+  // Monotonic counter, not just Date.now()+index: a multi-round agent turn
+  // renders every round synchronously in one tick (same millisecond), and
+  // `index` is always 0 (thinking blocks are merged before render). Without a
+  // per-section sequence the rounds collide on one id, so getElementById in the
+  // toggle handler always resolves to the first box — clicking round N opened
+  // round 1. See chatRenderer round loop + the delegated click handler below.
+  const id = `thinking-${Date.now()}-${_thinkSeq++}`;
   const timeHtml = thinkingTime ? `<span style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;">${thinkingTime}s</span>` : '';
   return `
     <div class="thinking-section">
@@ -904,6 +911,13 @@ document.addEventListener('click', function(e) {
     const set = _loadExpandedSet();
     if (!set.size) return;
     for (const sec of sections) {
+      // Skip resume-rendered turns: the resume renderer rebuilds the whole turn
+      // every ~140ms and restores its own expand state by index. Letting this
+      // hash-based observer also fire on each rebuild re-opened boxes every tick
+      // AND, because it matches by content, opened *every* same-content box (this
+      // model often repeats its thinking) — so clicking one box appeared to open
+      // a different one. Resume owns its boxes; only restore on canonical renders.
+      if (sec.closest('.resume-rendered')) continue;
       const content = sec.querySelector('.thinking-content');
       if (!content) continue;
       if (content.classList.contains('expanded')) continue;
