@@ -1255,7 +1255,14 @@ async def action_audit_skills(owner: str, **kwargs) -> Tuple[str, bool]:
         if not names:
             raise TaskNoop("no unaudited skills")
 
-        url, model, headers, teacher = _resolve_audit_models()
+        try:
+            url, model, headers, teacher = _resolve_audit_models(owner=owner)
+        except ValueError as e:
+            # No Default/Utility AND no enabled endpoint at all — a genuine
+            # can't-run, not a failure. Register it as a clean skip (TaskNoop)
+            # so the scheduler logs "skipped — <reason>" instead of a silent
+            # "completed" that hides that the audit never ran.
+            raise TaskNoop(f"skill audit skipped — {e}")
         try:
             from src.llm_core import seconds_since_model_activity
             recent = seconds_since_model_activity(url, model)

@@ -362,6 +362,36 @@ def resolve_endpoint_by_id(
         db.close()
 
 
+def resolve_any_enabled_endpoint(owner: Optional[str] = None) -> Optional[Tuple[str, str, Dict]]:
+    """Last-resort resolver: the first ENABLED endpoint (owner-scoped) that
+    yields a usable chat model, as (chat_url, model, headers).
+
+    Lets a fallback-less background feature (e.g. skill audit) degrade to some
+    working endpoint instead of hard-failing when the configured Default/Utility
+    points at a disabled or deleted endpoint — the footgun where chat still works
+    (it uses the live session endpoint) but the audit 400s on the stale Default.
+    Returns None only when there is genuinely no enabled endpoint to use.
+    """
+    db = SessionLocal()
+    try:
+        q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+        if owner:
+            from src.auth_helpers import owner_filter
+            q = owner_filter(q, ModelEndpoint, owner)
+        ids = [ep.id for ep in q.all()]
+    except Exception as e:
+        logger.debug(f"resolve_any_enabled_endpoint query failed: {e}")
+        ids = []
+    finally:
+        db.close()
+    # resolve_endpoint_by_id opens its own session, so close ours first.
+    for ep_id in ids:
+        resolved = resolve_endpoint_by_id(ep_id, owner=owner)
+        if resolved:
+            return resolved
+    return None
+
+
 def resolve_chat_fallback_candidates(owner: Optional[str] = None) -> list:
     """Build the configured default-chat fallback chain as a list of
     (chat_url, model, headers) tuples, skipping any that can't resolve.
