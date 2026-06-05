@@ -1003,10 +1003,22 @@ def _resolve_audit_models(owner=None):
     by the manual /audit-all route and scheduled/event audits. Raises
     ValueError if no worker model.
     """
-    from src.endpoint_resolver import resolve_endpoint
+    from src.endpoint_resolver import resolve_endpoint, resolve_any_enabled_endpoint
     url, model, headers = resolve_endpoint("utility", owner=owner)
     if not url or not model:
-        raise ValueError("No model configured — set a Default or Utility model in Settings.")
+        # Configured Default/Utility is unset or points at a disabled/deleted
+        # endpoint. Don't hard-fail (chat keeps working via the session endpoint,
+        # so the user may never notice the Default is stale) — degrade to any
+        # enabled endpoint so a misconfig can't 400 the audit.
+        fb = resolve_any_enabled_endpoint(owner=owner)
+        if fb:
+            url, model, headers = fb
+            logger.info(
+                "[audit] Default/Utility model unresolved; using enabled endpoint %s / %s",
+                url, model,
+            )
+        else:
+            raise ValueError("No model configured — set a Default or Utility model in Settings.")
     try:
         from src.llm_core import list_model_ids
         import os as _os
