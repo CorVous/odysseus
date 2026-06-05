@@ -2130,6 +2130,7 @@ async def stream_agent_loop(
     # Transparent retries for a round whose stream dies BEFORE any token — keeps
     # a transient single-slot stall from killing the turn (see _stream_round_with_retry).
     _round_retry_max = int(get_setting("agent_round_retry_max", 2) or 0)
+    _turn_had_error = False  # an LLM-stream error surfaced mid-turn (post-retry give-up)
 
     # Document streaming state (persists across rounds)
     _doc_acc = ""          # accumulated tool-call JSON arguments
@@ -2222,6 +2223,7 @@ async def stream_agent_loop(
                 break
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
+                _turn_had_error = True
                 yield chunk
                 continue
             if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
@@ -2939,6 +2941,26 @@ async def stream_agent_loop(
     if _exhausted_rounds:
         logger.info("[agent] round cap (%d) reached mid-task — emitting rounds_exhausted", max_rounds)
         yield f'data: {json.dumps({"type": "rounds_exhausted", "rounds": max_rounds})}\n\n'
+
+    # Mid-task error recovery. If the turn was cut short by a backend error but
+    # the agent had already DONE work (tool_events), the visible message persists
+    # while the gathered context would otherwise be lost — get_context_messages
+    # feeds the next turn only each message's `content`, and the tool RESULTS
+    # live in metadata.tool_events (kept for DISPLAY) + this turn's in-memory
+    # `messages`, neither of which is replayed. So the model restarts from
+    # scratch ("the chat persists but the context is gone"). Fix the asymmetry:
+    # fold a compact record of the completed work into the saved reply, so a
+    # follow-up / Continue resumes from it instead of redoing it.
+    if _turn_had_error and tool_events:
+        _recap = _build_actions_snapshot(tool_events, limit=3000)
+        if _recap:
+            _recap_md = (
+                "\n\n---\n*⚠️ This turn was interrupted by a backend error before "
+                "finishing. Work already completed this turn (so a continuation "
+                "can pick up here instead of restarting):*\n\n" + _recap
+            )
+            full_response += _recap_md
+            yield f'data: {json.dumps({"delta": _recap_md})}\n\n'
 
     # If the response is completely empty and no tools were executed,
     # yield a fallback message so the user is not left hanging.
