@@ -1915,6 +1915,10 @@ export function addMessage(role, content, modelName, metadata) {
           body.innerHTML = agentSourcesPrefix + markdownModule.processWithThinking(markdownModule.squashOutsideCode(txt)) + agentFindingsSuffix;
           wrap.appendChild(body);
           wrap.dataset.raw = txt;
+          // 0-based round index — lets the resume renderer update just this
+          // round's body in place on plain text deltas instead of rebuilding
+          // the whole multi-round turn every tick.
+          wrap.dataset.roundIdx = r;
           if (metadata?._db_id) wrap.dataset.dbId = metadata._db_id;
           box.appendChild(wrap);
           lastWrap = wrap;

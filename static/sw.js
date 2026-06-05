@@ -12,11 +12,42 @@
 // stale from an older SW cache.
 // v328: drop the chat.js self-trigger (it raced with the history re-render and
 // wiped the resume bubble); resume is driven solely by sessions._checkServerStream.
-// v329-v332: parity render, no-flash, per-round spinner, expanded in-progress think.
-// v336: resume reattach restores the Stop button.
+// v337: bump to force re-precache so clients pick up the latest static assets.
+// v338: add "Swipe to Open Sidebar" toggle (index.html + sidebar-layout.js).
 // v339: resume rerender preserves scroll (no more snap to last user message) and
 // thinking expand/collapse state (no more wrong-box / every-tick force-expand).
-const CACHE_NAME = 'odysseus-v339';
+// v340: actually land the "Swipe to Open Sidebar" toggle UI + guard (the v338
+// comment referenced it but the index.html/sidebar-layout.js changes weren't
+// merged until now).
+// v341: kind-prefixed jump-link routing fix (document-link-bounce-to-home).
+// v342: open orphaned library docs directly by id (library-open-orphaned-documents).
+// v344: agent AI tab — Max rounds input + Smart stop toggle.
+// v345: thinking-box fixes for multi-round/resumed turns —
+//       (1) unique section ids (markdown.js + chat.js live render) so the toggle
+//           handler resolves the box you clicked, not the first one;
+//       (2) kill the expand transition on resumed boxes so the open animation
+//           doesn't re-fire on every rerender tick;
+//       (3) the hash-restore observer skips resume-rendered turns (resume restores
+//           its own state by index) — stops per-tick re-expansion + same-content
+//           cross-firing (clicking one box opening another);
+//       (4) resume updates the body in place on plain text deltas (current round
+//           for tool turns, the merged bubble for no-tools turns) instead of
+//           rebuilding the whole turn every 140ms — fixes bursty, batched UI
+//           updates; full rebuild only at structural (round/tool) boundaries.
+// v346: resume scroll fixes — first paint after reattach snaps to the live turn
+//       (was leaving you parked at your last message); streaming thinking box is
+//       pinned to its latest line (innerHTML replacement was yanking it to the top
+//       and fighting scroll-down).
+// v347: resume paints the buffered backlog in ONE render (backend emits a
+//       `resume_synced` marker after replay; client accumulates until then)
+//       instead of a rapid burst of incremental updates, then streams the live tail.
+// v348: resume can't get stuck on "Reconnecting…" if the marker never arrives
+//       (e.g. backend not yet restarted) — a grace-period fallback forces the
+//       one-shot paint and switches to live rendering.
+// v349: that fallback is now a debounced idle timer (reset per event) so it fires
+//       only after the backlog burst drains, never mid-burst — fixes per-event
+//       re-renders/freeze when the marker is absent on a long playback.
+const CACHE_NAME = 'odysseus-v349';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
