@@ -172,6 +172,13 @@ async def subscribe(session_id: str) -> AsyncGenerator[str, None]:
         while next_seq < len(run.buffer):
             yield run.buffer[next_seq]
             next_seq += 1
+        # Replay-boundary marker: everything buffered so far has been delivered.
+        # Lets a reconnecting client paint the whole backlog at once and only then
+        # stream live, instead of replaying the backlog as a rapid burst of
+        # incremental updates. Sent per-subscriber (not via _publish), so it never
+        # enters the replay buffer. A fresh first-connect has an empty buffer and
+        # gets this immediately; the normal chat reader ignores unknown types.
+        yield 'data: {"type": "resume_synced"}\n\n'
         if run.status != "running":
             return
         heartbeat_idx = 0

@@ -110,6 +110,11 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   let _streamSessionId = null; // Session ID for the currently active reader loop
   let _lastReaderActivity = 0; // Timestamp of last reader.read() success — used to detect frozen streams
   let _webLockRelease = null;  // Function to release the Web Lock held during streaming
+  // Monotonic suffix for live thinking-box ids. Date.now() alone collides when a
+  // multi-round turn finalizes two rounds' <think> blocks in the same millisecond,
+  // and getElementById in the toggle handler then resolves both to the first box
+  // (clicking round 2 opened round 1). Mirrors the counter in markdown.js.
+  let _liveThinkSeq = 0;
 
   /** Check if an SSE reader is still actively connected for a session. */
   function hasActiveStream(sessionId) {
@@ -1366,7 +1371,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   }
                 }
                 // Assign stable IDs
-                var _thinkIdDone = 'think-' + Date.now();
+                var _thinkIdDone = 'think-' + Date.now() + '-' + (_liveThinkSeq++);
                 var _liveHdrDone = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
                 if (_liveHdrDone) _liveHdrDone.dataset.thinkingId = _thinkIdDone;
                 if (_liveThinkContent) _liveThinkContent.id = _thinkIdDone;
@@ -1646,7 +1651,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   }
 
                   // Assign stable IDs (for click-toggle handler in markdown.js)
-                  var _thinkId = 'think-' + Date.now();
+                  var _thinkId = 'think-' + Date.now() + '-' + (_liveThinkSeq++);
                   var _liveHdr = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
                   if (_liveHdr) _liveHdr.dataset.thinkingId = _thinkId;
                   if (_liveThinkContent) _liveThinkContent.id = _thinkId;
@@ -2036,7 +2041,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = _elapsed2 ? _formatThinkStats(_elapsed2, _liveThinkTokenCount) : '';
                   if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                   // Assign stable IDs
-                  var _thinkId2 = 'think-' + Date.now();
+                  var _thinkId2 = 'think-' + Date.now() + '-' + (_liveThinkSeq++);
                   var _liveHdr2 = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
                   if (_liveHdr2) _liveHdr2.dataset.thinkingId = _thinkId2;
                   if (_liveThinkContent) _liveThinkContent.id = _thinkId2;
@@ -3343,148 +3348,407 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   var _insertStreamDoneToast = chatStream.insertStreamDoneToast;
 
   /**
-   * Live-resume a chat run still streaming detached on the server (#2539).
-   *
-   * On session re-entry, GET /api/chat/resume/{id} replays the run's buffer then
-   * streams live; reply tokens render as they arrive. On completion a plain text
-   * reply is finalized in place (canonical bubble via chatRenderer.addMessage, no
-   * reload); a "rich" reply (tool calls, sources, doc streaming, multi-round) is
-   * reloaded from the DB so its full render stays faithful. Returns true if it
-   * attached, false to let the caller fall back to spinner+poll.
+   * Reattach to an in-progress server run after a FULL PAGE RELOAD.
+   * The backend tees every run's SSE events into a replay buffer
+   * (src/agent_runs.py); GET /api/chat/resume/<id> replays the backlog then
+   * streams live. We assemble the same {round_texts, tool_events} structure the
+   * canonical history renderer uses and re-render via chatRenderer.addMessage as
+   * events arrive — so the resumed turn looks IDENTICAL to a non-refreshed one
+   * (multi-round bubbles + expandable agent-thread tool nodes + thinking), with
+   * live progression. On completion we reload the session for the DB-canonical
+   * final render (metrics/footer). Returns true if started; false to let the
+   * caller fall back to its spinner+poll.
    */
   export async function resumeStream(sessionId) {
     if (!sessionId) return false;
-    if (hasActiveStream(sessionId)) return false;
-
+    if (hasActiveStream(sessionId)) return true; // already handled (foreground/another resume)
+    // Claim the re-attach lock synchronously so a second resume call dedupes via
+    // hasActiveStream. A dedicated set (not _backgroundStreams) so
+    // checkBackgroundStream doesn't mistake this for a same-tab POST stream and
+    // spawn its own spinner+poll on re-entry.
+    _resumingStreams.add(sessionId);
     let res;
     try {
-      res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`);
-    } catch (e) {
-      return false;
-    }
-    if (!res.ok || !res.body) return false;
+      res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`, { credentials: 'same-origin' });
+    } catch (_) { _resumingStreams.delete(sessionId); return false; }
+    if (!res.ok || !res.body) { _resumingStreams.delete(sessionId); return false; }
 
     const box = document.getElementById('chat-history');
-    if (!box) return false;
+    if (!box) { _resumingStreams.delete(sessionId); return false; }
 
-    // Block duplicate re-attach attempts while this reader is live. A dedicated
-    // set (not _backgroundStreams) so checkBackgroundStream doesn't mistake this
-    // for a same-tab POST stream and spawn its own spinner+poll on re-entry.
-    _resumingStreams.add(sessionId);
+    const meta = sessionModule.getSessions().find((s) => s.id === sessionId);
+    const model = (meta && meta.model) || '';
 
-    const holder = document.createElement('div');
-    holder.className = 'msg msg-ai';
-    const meta = sessionModule.getSessions().find(s => s.id === sessionId);
-    const roleLabel = _shortModel(meta && meta.model);
-    const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) +
-      ' <span class="role-timestamp">' + roleTs + '</span></div>' +
-      '<div class="body"><div class="stream-content"></div></div>';
-    _applyModelColor(holder.querySelector('.role'), meta && meta.model);
-    const contentDiv = holder.querySelector('.stream-content');
-    box.appendChild(holder);
+    // We're reattaching to a live, detached run — surface the Stop control so the
+    // user can cancel it. The send button's stop branch keys off `isStreaming`
+    // and calls abortCurrentRequest(true), which POSTs /api/chat/stop for
+    // `_streamSessionId`. Without this the resumed turn streamed in with no way
+    // to stop it short of a hard refresh.
+    isStreaming = true;
+    _streamSessionId = sessionId;
+    const _resumeSubmitBtn = document.querySelector('.send-btn');
+    if (_resumeSubmitBtn) updateSubmitButton('streaming', _resumeSubmitBtn);
 
-    const spinner = spinnerModule.create('Generating response...', 'right');
-    holder.querySelector('.body').appendChild(spinner.createElement());
+    // We rebuild the resumed message on each update; without this, the per-message
+    // `msg-enter` entry animation replays every rebuild and the card flashes.
+    // The thinking box's expand is a max-height *transition* (not an animation):
+    // each rebuild recreates it collapsed then re-applies `expanded`, so the
+    // 0.3s open transition replays every ~140ms tick — a constant flicker. Kill
+    // transitions on resumed thinking boxes too so an expanded one just stays
+    // open (it animates normally again after the post-completion canonical render).
+    if (!document.getElementById('resume-noanim-style')) {
+      const _st = document.createElement('style');
+      _st.id = 'resume-noanim-style';
+      _st.textContent = '.resume-rendered { animation: none !important; }'
+        + '.resume-rendered .thinking-content, .resume-rendered .thinking-toggle { transition: none !important; }';
+      document.head.appendChild(_st);
+    }
+
+    // A lightweight "reconnecting" placeholder until the first content renders.
+    const ph = document.createElement('div');
+    ph.className = 'msg msg-ai resume-rendered';
+    ph.innerHTML = '<div class="body"></div>';
+    const spinner = spinnerModule.create('Reconnecting to in-progress response…', 'right');
+    ph.querySelector('.body').appendChild(spinner.createElement());
     spinner.start();
+    box.appendChild(ph);
     uiModule.scrollHistory();
+    let phGone = false;
+    const killPlaceholder = () => { if (!phGone) { try { spinner.destroy(); } catch (_) {} if (ph.parentNode) ph.remove(); phGone = true; } };
+
+    // Accumulated structure, identical in shape to a persisted agent message.
+    const round_texts = [];
+    const tool_events = [];
+    let curRound = 0;            // 0-based index into round_texts (round 1)
+    let thinkOpen = false;
+    const addText = (d) => { round_texts[curRound] = (round_texts[curRound] || '') + d; };
+
+    // Per-round "generating" indicator — mirrors the live view's
+    // agent-thinking-dots spinner: shown whenever the run is active but
+    // momentarily producing no new content (turn start, between rounds, while
+    // the LLM is generating the next response), cleared as soon as content
+    // arrives. Without this the resumed turn has no "it's working" cue.
+    let _lastTool = '';
+    const _TLABELS = { web_search:'Searching', bash:'Running', python:'Running',
+      read_file:'Reading', write_file:'Writing', create_document:'Writing',
+      update_document:'Writing', manage_documents:'Reading', generate_image:'Generating',
+      manage_memory:'Remembering', trigger_research:'Researching' };
+    const _thinkLabel = () => _TLABELS[(_lastTool || '').toLowerCase()] || 'Thinking';
+    const removeThinking = () => {
+      const e = box.querySelector('.agent-thinking-dots');
+      if (e) { if (e._spinner) { try { e._spinner.destroy(); } catch (_) {} } e.remove(); }
+    };
+    let thinkTimer = null;
+    const showThinking = () => {
+      if (sessionModule.getCurrentSessionId() !== sessionId) return;
+      removeThinking();
+      const t = document.createElement('div'); t.className = 'msg msg-ai agent-thinking-dots';
+      const bd = document.createElement('div'); bd.className = 'body';
+      const sp = spinnerModule.create(_thinkLabel(), 'right', 'wave');
+      bd.appendChild(sp.createElement()); try { sp.start(120); } catch (_) {}
+      t._spinner = sp; t.appendChild(bd); box.appendChild(t); uiModule.scrollHistory();
+    };
+    // Remove now, re-show after a short pause (so steady streaming never flickers it).
+    const bumpThinking = () => { removeThinking(); if (thinkTimer) clearTimeout(thinkTimer); thinkTimer = setTimeout(showThinking, 450); };
+
+    // Re-render the whole in-progress message through the canonical renderer,
+    // replacing our previous render. Debounced to coalesce token bursts.
+    let rerenderTimer = null;
+    let lastThinkSecCount = 0;   // # of thinking sections last render — a jump means a new round started streaming
+    // Fast path for plain text deltas: instead of tearing down + re-parsing the
+    // WHOLE multi-round turn every 140ms (cost grows with turn length, so long
+    // turns batch updates into visible bursts), update just the current round's
+    // body in place. Full rebuild (doRerender) is reserved for structural changes
+    // (new round, tool start/output). `_fastBody`/`_fastRoundIdx` are (re)bound at
+    // the end of each full rebuild; null = no in-place target, fall back to rebuild.
+    let _fastBody = null;
+    let _fastRoundIdx = -1;
+    let _fastMerged = false;   // true when bound to the no-tools single merged bubble
+    // First content paint after reattaching: force the view to the bottom (the
+    // live agent turn). The normal nearBottom gate can't do this — appending the
+    // resumed turn below the last user message means the prior scroll position is
+    // no longer "near bottom", so without this the user is left parked at their
+    // last message instead of following the in-progress turn.
+    let _firstPaint = true;
+    // Expand/collapse a thinking section fully (content + chevron + label) so a
+    // reapplied state is indistinguishable from a user click. The old force-expand
+    // flipped only `.thinking-content`, leaving the chevron and "View thinking"
+    // label stale.
+    const applyThinkExpanded = (sec, expanded) => {
+      if (!sec) return;
+      const content = sec.querySelector('.thinking-content');
+      const header = sec.querySelector('.thinking-header[data-thinking-id]');
+      const id = header && header.dataset.thinkingId;
+      const toggle = id ? document.getElementById(id + '-toggle') : null;
+      if (content) content.classList.toggle('expanded', expanded);
+      if (toggle) toggle.classList.toggle('expanded', expanded);
+      const lbl = header && header.querySelector('.thinking-header-left span');
+      if (lbl) { const l = lbl.dataset.label || 'thinking process'; lbl.textContent = (expanded ? 'Hide ' : 'View ') + l; }
+    };
+    const doRerender = () => {
+      rerenderTimer = null;
+      if (sessionModule.getCurrentSessionId() !== sessionId) return;
+      killPlaceholder();
+      removeThinking();  // keep the spinner below freshly-rendered content (bump re-adds it)
+
+      // We tear down and rebuild the whole in-progress turn each tick, which
+      // discards two pieces of view state we have to restore by hand:
+      //  1. Which thinking sections the user expanded/collapsed — captured by
+      //     document order (rounds only ever get appended, so earlier indices
+      //     stay aligned) and reapplied after the rebuild.
+      //  2. Scroll position. Removing the turn collapses scrollHeight, which
+      //     clamps scrollTop upward (the view snaps to the last user message);
+      //     uiModule.scrollHistory()'s "user scrolled up" guard (>300px) then
+      //     refuses to recover for any turn taller than 300px. So we record
+      //     whether the user was parked at the bottom and re-pin deterministically.
+      const prevSecs = box.querySelectorAll('.resume-rendered .thinking-section');
+      const expandedIdx = new Set();
+      prevSecs.forEach((sec, i) => {
+        const c = sec.querySelector('.thinking-content');
+        if (c && c.classList.contains('expanded')) expandedIdx.add(i);
+      });
+      const autoScroll = !uiModule.getAutoScroll || uiModule.getAutoScroll();
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 120;
+      const prevTop = box.scrollTop;
+
+      box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
+      const before = new Set(Array.from(box.children));
+      // While a <think> block is still streaming (no </think> yet), close it just
+      // for rendering so it formats as a thinking section instead of raw text.
+      const rt = round_texts.slice();
+      if (thinkOpen && rt.length) rt[curRound] = (rt[curRound] || '') + '</think>';
+      const md = { model, timestamp: Date.now() };
+      try {
+        if (tool_events.length) {
+          md.round_texts = rt;
+          md.tool_events = tool_events;
+          addMessage('assistant', null, model, md);
+        } else {
+          addMessage('assistant', rt.join('\n\n'), model, md);
+        }
+      } catch (_) { /* keep streaming even if a render hiccups */ }
+      Array.from(box.children).forEach((c) => { if (!before.has(c)) c.classList.add('resume-rendered'); });
+
+      // Reapply the user's expand/collapse choices by document order.
+      const newSecs = box.querySelectorAll('.resume-rendered .thinking-section');
+      newSecs.forEach((sec, i) => { if (expandedIdx.has(i)) applyThinkExpanded(sec, true); });
+      // Auto-open a thinking section the first tick it appears (matches the live
+      // view, which shows each round's thinking open while it streams). We key off
+      // the section count growing rather than force-expanding the last box every
+      // tick, so a user collapse sticks instead of snapping back open.
+      if (thinkOpen && newSecs.length > lastThinkSecCount) applyThinkExpanded(newSecs[newSecs.length - 1], true);
+      lastThinkSecCount = newSecs.length;
+      // Pin the actively-streaming thinking box to its latest line (see fastTextUpdate).
+      if (thinkOpen && newSecs.length) {
+        const _tc = newSecs[newSecs.length - 1].querySelector('.thinking-content');
+        if (_tc) _tc.scrollTop = _tc.scrollHeight;
+      }
+
+      // Restore scroll: on the first paint after reattaching, snap to the bottom
+      // so the user lands on the live turn (not their last message). Afterwards
+      // re-pin to the bottom only if they were parked there (instant, bypassing
+      // scrollHistory's scrolled-up guard); otherwise hold their reading position
+      // rather than letting the teardown yank it to the last user message.
+      if (_firstPaint) { box.scrollTop = box.scrollHeight; _firstPaint = false; }
+      else if (autoScroll && nearBottom) box.scrollTop = box.scrollHeight;
+      else box.scrollTop = prevTop;
+
+      // Bind the in-place text target so plain deltas can update it without a full
+      // rebuild. Per-round (tool_events) render → the current round's wrap; no-tools
+      // render → the single merged bubble. Null = no target, fall back to rebuild.
+      _fastBody = null;
+      _fastRoundIdx = -1;
+      _fastMerged = false;
+      if (tool_events.length) {
+        const wraps = box.querySelectorAll('.resume-rendered.msg-ai[data-round-idx]');
+        const lastTxt = wraps[wraps.length - 1];
+        if (lastTxt) {
+          _fastBody = lastTxt.querySelector('.body');
+          _fastRoundIdx = parseInt(lastTxt.dataset.roundIdx, 10);
+        }
+      } else {
+        // No-tools merged render: one assistant bubble (dataset.raw set, no
+        // round index). Bind its body for in-place merged-text updates.
+        const wraps = box.querySelectorAll('.resume-rendered.msg-ai');
+        for (let i = wraps.length - 1; i >= 0; i--) {
+          const w = wraps[i];
+          if (w.dataset && w.dataset.raw !== undefined && w.dataset.roundIdx === undefined) {
+            _fastBody = w.querySelector('.body');
+            _fastMerged = true;
+            break;
+          }
+        }
+      }
+    };
+    const scheduleRerender = () => { if (!rerenderTimer) rerenderTimer = setTimeout(doRerender, 140); };
+
+    // In-place update of just the current round's body. Returns false (caller
+    // falls back to a full rebuild) when there's no valid target — e.g. the
+    // round's wrap doesn't exist yet (its first delta), or the bound body is for
+    // a different/earlier round. Re-renders the whole current-round text through
+    // the canonical pipeline so thinking open/close is handled identically to a
+    // full rebuild, just scoped to one round instead of the entire turn.
+    const fastTextUpdate = () => {
+      if (!_fastBody || !_fastBody.isConnected) return false;
+      if (sessionModule.getCurrentSessionId() !== sessionId) return false;
+      let html;
+      try {
+        if (_fastMerged) {
+          // Mirror the no-tools merged render: all rounds joined, run through the
+          // same stripToolBlocks → squash → thinking pipeline chatRenderer uses.
+          const rt = round_texts.slice();
+          if (thinkOpen && rt.length) rt[curRound] = (rt[curRound] || '') + '</think>';
+          html = markdownModule.processWithThinking(
+            markdownModule.squashOutsideCode(stripToolBlocks(rt.join('\n\n'))));
+        } else {
+          if (_fastRoundIdx !== curRound) return false;
+          let txt = round_texts[curRound] || '';
+          if (thinkOpen) txt = txt + '</think>';   // close for rendering while it streams
+          html = markdownModule.processWithThinking(markdownModule.squashOutsideCode(txt));
+        }
+      } catch (_) { return false; }
+      const autoScroll = !uiModule.getAutoScroll || uiModule.getAutoScroll();
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 120;
+      _fastBody.innerHTML = html;
+      // Keep the actively-streaming round's thinking open (matches doRerender's
+      // auto-open + the live view); once it closes it renders collapsed by default.
+      if (thinkOpen) {
+        const sec = _fastBody.querySelector('.thinking-section');
+        applyThinkExpanded(sec, true);
+        // Pin the thinking box to its latest line — innerHTML replacement resets
+        // its scrollTop to 0 each delta, which yanked the view to the top and
+        // fought the user scrolling down (matches the live path's bottom-pin).
+        const tc = sec && sec.querySelector('.thinking-content');
+        if (tc) tc.scrollTop = tc.scrollHeight;
+      }
+      if (_firstPaint) { box.scrollTop = box.scrollHeight; _firstPaint = false; }
+      else if (autoScroll && nearBottom) box.scrollTop = box.scrollHeight;
+      return true;
+    };
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let roundText = '';
-    let gotDelta = false;
-    let leftSession = false;
-    let metricsData = null;
-    // "Rich" responses (tool calls, sources, doc streaming, multi-round) need the
-    // full canonical render, which is rebuilt from the saved DB record on reload.
-    // Plain text replies can be finalized in place without a reload.
-    let rich = false;
-
-    const cleanup = () => {
-      try { spinner.destroy(); } catch (_) {}
-      _resumingStreams.delete(sessionId);
+    let done = false;
+    // The backend replays the buffered backlog, then emits a `resume_synced`
+    // marker, then streams live. We accumulate the backlog into state WITHOUT
+    // rendering, paint it once on the marker (one render, not a rapid burst of
+    // incremental updates), then render per-event for the live tail. A run that
+    // already finished sends [DONE] within the backlog (before the marker); the
+    // finally-block flush paints it once in that case.
+    let synced = false;
+    // Fallback so a missing marker can never leave us stuck on "Reconnecting…"
+    // (backend too old to emit it, or a dropped event). A debounced idle timer,
+    // reset on EVERY event, fires the one-shot paint only once events go quiet for
+    // a beat — i.e. the backlog burst has fully drained. Resetting on each event is
+    // what keeps it from firing mid-burst (which would flip to live mode and make
+    // the rest of the backlog render per-event — the freeze). An absolute cap
+    // backstops the case where events never pause (fast live generation, no marker).
+    let syncIdleTimer = null;
+    let syncCapTimer = null;
+    const forceSync = () => {
+      if (synced) return;
+      synced = true;
+      if (syncIdleTimer) { clearTimeout(syncIdleTimer); syncIdleTimer = null; }
+      if (syncCapTimer) { clearTimeout(syncCapTimer); syncCapTimer = null; }
+      try { doRerender(); } catch (_) {}
+      bumpThinking();
     };
-
-    const renderDelta = () => {
-      const dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(roundText));
-      contentDiv.innerHTML = markdownModule.mdToHtml(markdownModule.squashOutsideCode(dt));
-      uiModule.scrollHistory();
+    const armSyncIdle = () => {
+      if (synced) return;
+      if (syncIdleTimer) clearTimeout(syncIdleTimer);
+      syncIdleTimer = setTimeout(forceSync, 300);
     };
-
+    syncCapTimer = setTimeout(forceSync, 2500);
     try {
-      readLoop:
-      while (true) {
-        // User left this session: stop rendering, the run continues server-side.
-        if (sessionModule.getCurrentSessionId &&
-            sessionModule.getCurrentSessionId() !== sessionId) {
-          leftSession = true;
-          try { await reader.cancel(); } catch (_) {}
-          break;
-        }
-        const { done, value } = await reader.read();
-        if (done) break;
+      while (!done) {
+        if (sessionModule.getCurrentSessionId() !== sessionId) { try { reader.cancel(); } catch (_) {} break; }
+        const { value, done: rdone } = await reader.read();
+        _lastReaderActivity = Date.now();   // keep the tab-recovery watchdog from false-firing on resume
+        if (rdone) break;
         buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop();
-        for (const part of parts) {
-          const line = part.split('\n').find(l => l.startsWith('data: '));
-          if (!line) continue;
-          const payload = line.slice(6);
-          if (payload === '[DONE]') {
-            try { await reader.cancel(); } catch (_) {}
-            break readLoop;
-          }
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') { done = true; break; }
           let json;
-          try { json = JSON.parse(payload); } catch (_) { continue; }
-          if (json.delta) {
-            roundText += json.delta;
-            if (!gotDelta) { gotDelta = true; try { spinner.destroy(); } catch (_) {} }
-            renderDelta();
-          } else if (json.type === 'doc_stream_open') {
-            rich = true;
-            if (documentModule) documentModule.streamDocOpen(json.title || '', json.lang || '');
-          } else if (json.type === 'doc_stream_delta') {
-            rich = true;
-            if (documentModule && json.delta) documentModule.streamDocDelta(json.delta);
-          } else if (json.type === 'metrics') {
-            metricsData = json.data || metricsData;
-          } else if (json.type === 'tool_start' || json.type === 'tool_output' ||
-                     json.type === 'tool_progress' || json.type === 'agent_step' ||
-                     json.type === 'web_sources' || json.type === 'rag_sources' ||
-                     json.type === 'research_progress' || json.type === 'research_sources' ||
-                     json.type === 'research_findings' || json.type === 'research_done') {
-            rich = true;
+          try { json = JSON.parse(data); } catch (_) { continue; }
+          // While catching up, push back the idle fallback on each event so it
+          // only fires after the backlog burst drains (never mid-burst).
+          if (!synced) armSyncIdle();
+          if (json.type === 'resume_synced') {
+            // Backlog fully delivered — paint it all in one render, then stream
+            // the live tail incrementally. doRerender's first-paint snaps to the
+            // bottom (the live turn).
+            forceSync();
+          } else if (json.delta) {
+            let d = json.delta;
+            if (json.thinking) { if (!thinkOpen) { d = '<think>' + d; thinkOpen = true; } }
+            else if (thinkOpen) { d = '</think>' + d; thinkOpen = false; }
+            addText(d);
+            // Before sync: accumulate only (the resume_synced marker paints it).
+            // After: try the cheap in-place update first, falling back to a full
+            // teardown+rebuild when there's no bound target (round's first delta,
+            // or the no-tools merged-message path). Keeps long turns smooth.
+            if (synced) {
+              if (!(rerenderTimer === null && fastTextUpdate())) scheduleRerender();
+              bumpThinking();
+            }
+          } else if (json.type === 'agent_step') {
+            if (thinkOpen) { addText('</think>'); thinkOpen = false; }
+            if (typeof json.round === 'number' && json.round > 0) curRound = json.round - 1;
+            _fastBody = null;   // new round — structure changed, force a full rebuild
+            if (synced) bumpThinking();   // new round — LLM is generating again
+          } else if (json.type === 'tool_start') {
+            _lastTool = json.tool || _lastTool;
+            tool_events.push({ round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '', output: '', exit_code: null, _pending: true });
+            _fastBody = null;   // tool node added — structure changed
+            if (synced) { scheduleRerender(); bumpThinking(); }
+          } else if (json.type === 'tool_output') {
+            // Fill the matching pending tool node (or push if we missed its start).
+            let ev = null;
+            for (let i = tool_events.length - 1; i >= 0; i--) {
+              if (tool_events[i]._pending && tool_events[i].tool === json.tool) { ev = tool_events[i]; break; }
+            }
+            if (!ev) { ev = { round: json.round || (curRound + 1), tool: json.tool || 'tool', command: json.command || '' }; tool_events.push(ev); }
+            ev.output = json.output || ''; ev.exit_code = json.exit_code; ev._pending = false;
+            _fastBody = null;   // tool node changed — structure changed
+            if (synced) { scheduleRerender(); bumpThinking(); }   // tool done — LLM will generate the next response
+          } else if (json.type === 'doc_stream_open' && documentModule) {
+            try { documentModule.streamDocOpen(json.title || '', json.language || ''); } catch (_) {}
+          } else if (json.type === 'doc_stream_delta' && documentModule) {
+            try { documentModule.streamDocDelta(json.content || ''); } catch (_) {}
           }
         }
       }
-    } catch (e) {
-      // Network drop or parse failure: fall through to the reload below.
+    } catch (_) {
+      // fall through to finalize
+    } finally {
+      if (syncIdleTimer) { clearTimeout(syncIdleTimer); syncIdleTimer = null; }
+      if (syncCapTimer) { clearTimeout(syncCapTimer); syncCapTimer = null; }
+      if (rerenderTimer) { clearTimeout(rerenderTimer); rerenderTimer = null; }
+      if (thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
+      removeThinking();
+      // Flush a final render — when the backlog + [DONE] arrive in one burst the
+      // debounced timer would otherwise be cancelled here before it ever fired.
+      try { doRerender(); } catch (_) {}
+      _resumingStreams.delete(sessionId);
+      if (_streamSessionId === sessionId) _streamSessionId = null;
+      isStreaming = false;
+      killPlaceholder();
+      if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        // Run ended — clear the Stop control / isStreaming flag promptly
+        // (selectSession also resets the button, but async after a history fetch).
+        const _sb = document.querySelector('.send-btn');
+        if (_sb) updateSubmitButton('idle', _sb);
+        // Reload for the DB-canonical final render (metrics, footer, persisted ids).
+        sessionModule.selectSession(sessionId);
+      } else {
+        box.querySelectorAll('.resume-rendered').forEach((e) => e.remove());
+      }
     }
-
-    cleanup();
-    if (leftSession) { if (holder.parentNode) holder.remove(); return true; }
-
-    const onThisSession = sessionModule.getCurrentSessionId &&
-                          sessionModule.getCurrentSessionId() === sessionId;
-
-    // Plain text reply: finalize in place. Replace the live bubble with a
-    // canonical single message (markdown + footer actions + metrics) using the
-    // same renderer history does. No history refetch, no end-of-stream flicker.
-    if (onThisSession && !rich && roundText.trim()) {
-      if (holder.parentNode) holder.remove();
-      const model = meta && meta.model;
-      const meta_ = metricsData ? Object.assign({ model }, metricsData) : { model };
-      chatRenderer.addMessage('assistant', roundText, model, meta_);
-      uiModule.scrollHistory();
-      return true;
-    }
-
-    // Rich response (tools, sources, docs, multi-round) or user moved on:
-    // reload from the DB for the full canonical render.
-    if (holder.parentNode) holder.remove();
-    if (onThisSession) sessionModule.selectSession(sessionId);
-    else sessionModule.loadSessions();
     return true;
   }
 

@@ -7,7 +7,13 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v327';
+// v351: re-baselined integration on upstream/main (caught up 141 commits) +
+//       re-applied the non-superseded local-model fixes. Resume is now upstream's
+//       implementation (our resume override was dropped in the catch-up).
+// v352: re-implemented the live agentic resume (live multi-round bubbles + tool
+//       nodes + thinking on reattach) over upstream's detached-run buffer, plus
+//       the thinking-box id/observer/transition fixes and the resume_synced marker.
+const CACHE_NAME = 'odysseus-v352';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
