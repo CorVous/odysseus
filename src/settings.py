@@ -111,6 +111,15 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget` in src/context_budget.py.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Cross-turn tool-result replay: fold the saved tool_events (commands +
+    # output heads) from the most recent N assistant turns back into the agent's
+    # context on a follow-up, so it sees what it already ran instead of redoing
+    # it. Bounded by a token budget (newest turns first); older turns stay as
+    # plain prose. 0 turns disables. Tuned small by default — a weak/local model
+    # loses coherence as context grows, so this is a sliding window, not full
+    # replay. See routes/chat_helpers._inject_recent_tool_results.
+    "agent_tool_result_replay_turns": 2,
+    "agent_tool_result_replay_token_budget": 6000,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
