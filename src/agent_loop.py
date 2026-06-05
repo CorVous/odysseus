@@ -2029,6 +2029,23 @@ async def stream_agent_loop(
     # Strip internal metadata keys before sending to the LLM API
     messages = [{k: v for k, v in msg.items() if k != "_protected"} for msg in messages]
 
+    # Content-free visibility into exactly what the model receives this turn —
+    # including resumed/continued turns. Logs the message count and estimated
+    # input tokens against the model's context window so a "did it get the
+    # history?" question is answerable from the log without reading any message
+    # text. A low count here on a continued turn = context was dropped upstream.
+    try:
+        _roles = collections.Counter(m.get("role", "?") for m in messages)
+        logger.info(
+            "[agent] dispatch: %s messages (%s), ~%s input tokens, context_window=%s",
+            len(messages),
+            " ".join(f"{r}={n}" for r, n in sorted(_roles.items())),
+            estimate_tokens(messages),
+            context_length,
+        )
+    except Exception:
+        pass
+
     yield f"data: {json.dumps({'type': 'agent_prep', 'data': {k: round(v, 3) for k, v in prep_timings.items()}})}\n\n"
 
     full_response = ""
