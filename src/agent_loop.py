@@ -1925,6 +1925,10 @@ async def stream_agent_loop(
                 # over the full conversation (which already holds every tool
                 # result) before falling back to the canned apology.
                 _synth = ""
+                # Grace synthesis is a SILENT non-streaming call that can run
+                # tens of seconds on a slow local model — surface a live status
+                # so the wait reads as "working", not a frozen turn.
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num, "note": "Writing the final answer…"})}\n\n'
                 try:
                     from src.llm_core import llm_call_async
                     _synth_messages = list(messages) + [{
