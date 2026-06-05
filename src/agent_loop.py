@@ -1658,6 +1658,13 @@ async def stream_agent_loop(
     _recent_call_sigs = collections.deque(maxlen=6)
     _stuck_rounds = 0
     _tool_type_counts: collections.Counter = collections.Counter()
+    # Read-only exploration tools where hitting a NEW target each round is
+    # genuine progress, not a runaway: reading 20 distinct files to understand a
+    # codebase must not trip the same backstop as 20 identical calls. For these
+    # we only count a REPEAT of an already-seen target toward the runaway; the
+    # distinct-targets set below tracks what's been read.
+    _EXPLORE_TOOLS = {"read_file"}
+    _explore_targets_seen: Set[str] = set()
     _THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
     # Supervisor: how many times we've nudged the model after it announced
@@ -2090,7 +2097,17 @@ async def stream_agent_loop(
         _is_repeat = _sig in _recent_call_sigs
         _recent_call_sigs.append(_sig)
         for _b in tool_blocks:
-            _tool_type_counts[_b.tool_type] += 1
+            # Exploration tools (read_file): a new distinct target is progress,
+            # so it doesn't accrue toward the runaway backstop — only a repeat
+            # of an already-seen target does. Everything else counts every call.
+            if _b.tool_type in _EXPLORE_TOOLS:
+                _target = (_b.content or "").strip()
+                if _target in _explore_targets_seen:
+                    _tool_type_counts[_b.tool_type] += 1
+                else:
+                    _explore_targets_seen.add(_target)
+            else:
+                _tool_type_counts[_b.tool_type] += 1
         # "Real" answer text = round text minus <think> blocks. Empty-think
         # rounds (just "<think>\n\n</think>" + a tool call) must not read as
         # progress, so strip think before checking.
