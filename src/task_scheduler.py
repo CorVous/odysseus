@@ -1398,7 +1398,7 @@ class TaskScheduler:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task.prompt},
             ]
-            result = await llm_call_async(url=endpoint_url, model=model, messages=messages, timeout=120)
+            result = await llm_call_async(url=endpoint_url, model=model, messages=messages, timeout=120, background=True)
 
         # Strip the model's chain-of-thought before saving/delivering. Task
         # output is LLM-only, so prose=True (which also removes untagged
