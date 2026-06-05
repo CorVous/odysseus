@@ -111,6 +111,12 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget` in src/context_budget.py.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Loop-breaker backstop: force a tool-free "write your answer now" round when
+    # the model circles (4 useless rounds) or runs one tool away (>=15x). Protects
+    # weak models from burning all rounds with no output, but its trip fires a
+    # SILENT grace-synthesis call that reads as a pause, and it false-trips on
+    # heavy codebase exploration. Turn off for capable models / file-heavy work.
+    "agent_loop_breaker_enabled": True,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell

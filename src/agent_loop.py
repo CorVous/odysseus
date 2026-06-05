@@ -1660,6 +1660,12 @@ async def stream_agent_loop(
     _tool_type_counts: collections.Counter = collections.Counter()
     _THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
+    # Loop-breaker kill-switch. When off, the model is never force-answered for
+    # circling/runaway — it explores freely until it writes an answer or hits
+    # MAX_AGENT_ROUNDS. Useful for codebase work on capable models where the
+    # backstop's premature trip caused a silent grace-synthesis pause. Default
+    # on (protects weak models from burning all rounds with no output).
+    _loop_breaker_on = bool(get_setting("agent_loop_breaker_enabled", True))
     # Supervisor: how many times we've nudged the model after it announced
     # an action without emitting the tool call. Capped to prevent a model
     # that *can't* call the tool from looping forever.
@@ -2102,7 +2108,7 @@ async def stream_agent_loop(
         else:
             _stuck_rounds = 0
         _runaway = next((t for t, n in _tool_type_counts.items() if n >= 15), None)
-        if _stuck_rounds >= 4 or _runaway:
+        if _loop_breaker_on and (_stuck_rounds >= 4 or _runaway):
             reason = (f"calling {_runaway} over and over" if _runaway
                       else "repeating the same tool calls without new progress")
             logger.warning(f"[agent] loop-breaker tripped on round {round_num} ({reason}); sig={_sig[:80]!r}")
