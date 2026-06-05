@@ -464,6 +464,12 @@ async function loadEndpoints() {
             </div>
           </div>
           <div class="admin-ep-detail">${esc(ep.base_url)}${category === 'local' ? `<button type="button" class="admin-ep-copy-btn" data-adm-copy-url="${esc(ep.base_url)}" title="Copy URL" aria-label="Copy URL" style="background:none;border:none;padding:0 2px;margin-left:6px;cursor:pointer;color:inherit;opacity:0.45;vertical-align:-2px;line-height:1;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` : ''}${keyLabel}</div>
+          ${/openrouter\.ai/i.test(ep.base_url || '') ? `
+          <div class="admin-ep-detail" style="display:flex;gap:4px;align-items:center;margin-top:3px;">
+            <span style="font-size:10px;opacity:0.5;white-space:nowrap;" title='OpenRouter "provider" routing object sent in the request body — e.g. {"order":["DeepInfra"],"allow_fallbacks":false}'>Provider routing</span>
+            <input type="text" data-adm-or-routing-input="${ep.id}" value="${esc(ep.provider_routing || '')}" placeholder='{"order":["DeepInfra"],"allow_fallbacks":false}' spellcheck="false" style="flex:1;min-width:0;font-family:monospace;font-size:11px;padding:2px 5px;" />
+            <button class="admin-btn-sm" data-adm-or-routing-save="${ep.id}">Save</button>
+          </div>` : ''}
           ${hasModels ? `<div class="mcp-tools-panel hidden" data-adm-ep-models-panel="${ep.id}"></div>` : ''}
         </div>`;
     });
@@ -501,6 +507,35 @@ async function loadEndpoints() {
     };
     queryAll('[data-adm-toggle-ep]').forEach(btn => {
       btn.addEventListener('click', async (e) => { e.stopPropagation(); await fetch(`/api/model-endpoints/${btn.dataset.admToggleEp}`, { method: 'PATCH' }); loadEndpoints(); });
+    });
+    queryAll('[data-adm-or-routing-save]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const epId = btn.dataset.admOrRoutingSave;
+        const input = document.querySelector(`[data-adm-or-routing-input="${epId}"]`);
+        const val = input ? input.value.trim() : '';
+        const orig = btn.textContent;
+        btn.disabled = true; btn.textContent = '…';
+        try {
+          const res = await fetch(`/api/model-endpoints/${epId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ provider_routing: val }),
+          });
+          if (!res.ok) {
+            let msg = 'Save failed';
+            try { const j = await res.json(); msg = j.detail || msg; } catch (_) {}
+            btn.textContent = 'Error'; alert(msg);
+            setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1200);
+            return;
+          }
+          btn.textContent = 'Saved ✓';
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1000);
+        } catch (_) {
+          btn.textContent = 'Error'; btn.disabled = false;
+        }
+      });
     });
     queryAll('[data-adm-copy-url]').forEach(btn => {
       btn.addEventListener('click', (e) => {

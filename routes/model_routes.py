@@ -911,6 +911,32 @@ def _normalize_model_ids(value):
     return out
 
 
+def _normalize_provider_routing(value):
+    """Validate an OpenRouter `provider` routing object input.
+
+    Accepts a dict or a JSON-encoded object string (from a form field). Returns
+    a compact JSON string to store, or None for empty input. Raises
+    HTTPException(400) on malformed JSON or a non-object value so the admin gets
+    a clear error instead of silently dropping the config.
+    """
+    if value is None:
+        return None
+    obj = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            obj = json.loads(text)
+        except Exception:
+            raise HTTPException(400, "provider_routing must be valid JSON")
+    if not isinstance(obj, dict):
+        raise HTTPException(400, "provider_routing must be a JSON object")
+    if not obj:
+        return None
+    return json.dumps(obj, separators=(",", ":"))
+
+
 def _merge_model_ids(*lists):
     """Concatenate model-ID lists, de-duplicating and preserving order."""
     out, seen = [], set()
@@ -967,6 +993,13 @@ def setup_model_routes(model_discovery):
         affects the visible endpoint list (CRUD on ModelEndpoint, prefs
         flip)."""
         _models_cache.clear()
+        # OpenRouter provider-routing is cached host-keyed in llm_core; drop it
+        # so an edited routing config takes effect on the next dispatch.
+        try:
+            from src.llm_core import invalidate_provider_routing_cache
+            invalidate_provider_routing_cache()
+        except Exception:
+            pass
 
     # Track model-list refreshes by URL+key. This prevents repeated picker/API
     # opens from starting duplicate /models probes, and gives slow/offline
@@ -1545,6 +1578,7 @@ def setup_model_routes(model_discovery):
                     "model_refresh_mode": _endpoint_refresh_mode(r, kind),
                     "model_refresh_interval": getattr(r, "model_refresh_interval", None),
                     "model_refresh_timeout": getattr(r, "model_refresh_timeout", None),
+                    "provider_routing": getattr(r, "provider_routing", None),
                 })
             return results
         finally:
@@ -1565,6 +1599,7 @@ def setup_model_routes(model_discovery):
         model_refresh_timeout: str = Form(""),
         supports_tools: str = Form(""),  # "true"/"false"/"" (unknown)
         pinned_models: str = Form(""),  # admin-pinned IDs: list/JSON/comma/newline
+        provider_routing: str = Form(""),  # OpenRouter `provider` object as JSON
         container_local: str = Form("false"),
         # Default `shared=true` → endpoints are visible to all users (the
         # app's historical behaviour). Admins can pass `shared=false` to
@@ -1702,6 +1737,7 @@ def setup_model_routes(model_discovery):
             _st_raw = (supports_tools or "").strip().lower()
             _st = True if _st_raw in ("true", "1", "yes") else (False if _st_raw in ("false", "0", "no") else None)
             _pinned = _normalize_model_ids(pinned_models)
+            _routing = _normalize_provider_routing(provider_routing)
             # Stamp owner so the picker only shows this endpoint to the admin
             # who added it. Pass `shared=true` to mark it null-owner (visible
             # to all users), preserving the pre-fix "everyone sees everything"
@@ -1722,6 +1758,7 @@ def setup_model_routes(model_discovery):
                 model_refresh_timeout=refresh_timeout,
                 cached_models=json.dumps(model_ids) if model_ids else None,
                 pinned_models=json.dumps(_pinned) if _pinned else None,
+                provider_routing=_routing,
                 supports_tools=_st,
                 owner=_owner_val,
             )
@@ -2070,6 +2107,9 @@ def setup_model_routes(model_discovery):
                 if "model_refresh_timeout" in body:
                     timeout = _parse_positive_int(body.get("model_refresh_timeout"), minimum=1, maximum=60)
                     ep.model_refresh_timeout = timeout
+                if "provider_routing" in body:
+                    # Empty string / {} / null clears it back to the default.
+                    ep.provider_routing = _normalize_provider_routing(body["provider_routing"])
                 # Rotating an API key used to require DELETE+POST, which wiped
                 # endpoint_url/model from every session referencing the old base
                 # URL. Allow in-place updates so the admin can change the key
@@ -2103,6 +2143,7 @@ def setup_model_routes(model_discovery):
                 "model_refresh_mode": getattr(ep, "model_refresh_mode", None) or "auto",
                 "model_refresh_interval": getattr(ep, "model_refresh_interval", None),
                 "model_refresh_timeout": getattr(ep, "model_refresh_timeout", None),
+                "provider_routing": getattr(ep, "provider_routing", None),
             }
         finally:
             db.close()

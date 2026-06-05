@@ -510,6 +510,57 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     return h
 
 
+# OpenRouter per-endpoint provider routing — the `provider` object placed in
+# the chat-completion body to steer which upstream serves the request
+# (order/only/ignore/sort/allow_fallbacks/quantizations). It's configured on
+# the ModelEndpoint row, but the dispatch layer only carries the URL, so we
+# resolve it here by host. Cached per host; cleared on endpoint writes via
+# invalidate_provider_routing_cache().
+_provider_routing_cache: Dict[str, Optional[dict]] = {}
+
+
+def invalidate_provider_routing_cache() -> None:
+    """Drop the cached OpenRouter routing config (call after endpoint writes)."""
+    _provider_routing_cache.clear()
+
+
+def _openrouter_provider_routing(url: str) -> Optional[dict]:
+    """Return the OpenRouter `provider` routing object configured on the
+    endpoint matching this URL's host, or None. Result cached per host.
+
+    Keyed by host because dispatch only has the URL — with more than one
+    OpenRouter endpoint the first one carrying routing wins (a rare config).
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if host in _provider_routing_cache:
+        return _provider_routing_cache[host]
+    routing: Optional[dict] = None
+    if not _host_match(url, "openrouter.ai"):
+        _provider_routing_cache[host] = None
+        return None
+    try:
+        from src.database import SessionLocal, ModelEndpoint
+        db = SessionLocal()
+        try:
+            rows = db.query(ModelEndpoint).filter(
+                ModelEndpoint.provider_routing.isnot(None)
+            ).all()
+            for ep in rows:
+                if not _host_match(ep.base_url or "", "openrouter.ai"):
+                    continue
+                raw = ep.provider_routing
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict) and parsed:
+                    routing = parsed
+                    break
+        finally:
+            db.close()
+    except Exception:
+        routing = None
+    _provider_routing_cache[host] = routing
+    return routing
+
+
 def _provider_label(url: str) -> str:
     """Human-friendly provider name for error messages."""
     if not url:
@@ -1210,6 +1261,10 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        if provider == "openrouter":
+            routing = _openrouter_provider_routing(url)
+            if routing:
+                payload["provider"] = routing
     try:
         note_model_activity(target_url, model)
         r = httpx.post(target_url, headers=h, json=payload, timeout=timeout)
@@ -1408,6 +1463,10 @@ async def llm_call_async(
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
+        if provider == "openrouter":
+            routing = _openrouter_provider_routing(url)
+            if routing:
+                payload["provider"] = routing
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -1531,6 +1590,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
+        if provider == "openrouter":
+            routing = _openrouter_provider_routing(url)
+            if routing:
+                payload["provider"] = routing
         h = _provider_headers(provider, headers)
         if provider == "copilot":
             from src.copilot import apply_request_headers
