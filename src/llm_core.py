@@ -220,6 +220,40 @@ def _clear_host_dead(url: str) -> None:
         _host_fails.pop(key, None)
 
 
+# Connection-establishment budget. A reachable LOCAL/Tailscale peer answers the
+# SYN in <100ms, so 3s is plenty and keeps a dead local upstream from wedging
+# the UI. But a PUBLIC cloud endpoint (OpenRouter, OpenAI, Groq…) pays real
+# DNS+TCP+TLS latency on a cold connection that can exceed 3s — and a 3s cap
+# there produced false ConnectTimeouts that tripped the dead-host cooldown,
+# 503-ing every request for DEAD_HOST_COOLDOWN seconds even though the host was
+# fine. Cloud hosts get a roomier connect budget; a truly dead one still cools
+# after _HOST_FAIL_THRESHOLD attempts, then fails instantly.
+_LOCAL_CONNECT_TIMEOUT = 3.0
+_CLOUD_CONNECT_TIMEOUT = 10.0
+
+
+def _is_local_host(url: str) -> bool:
+    """True for loopback, RFC-1918 private, or Tailscale-CGNAT (100.64/10) hosts."""
+    host = (urlparse(url).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return True
+    if host.startswith(("10.", "192.168.")):
+        return True
+    for prefix, lo, hi in (("172.", 16, 31), ("100.", 64, 127)):
+        if host.startswith(prefix):
+            try:
+                if lo <= int(host.split(".")[1]) <= hi:
+                    return True
+            except (ValueError, IndexError):
+                pass
+    return False
+
+
+def _connect_timeout_for(url: str) -> float:
+    """Connect-phase timeout: tight for local peers, forgiving for cloud hosts."""
+    return _LOCAL_CONNECT_TIMEOUT if _is_local_host(url) else _CLOUD_CONNECT_TIMEOUT
+
+
 # Shared async HTTP client. Reusing one client keeps connections warm:
 # repeat calls to api.anthropic.com / api.openai.com / openrouter skip the
 # 100-500ms TCP+TLS handshake. Lazy init so we bind to the running event loop.
@@ -1412,7 +1446,7 @@ async def llm_call_async(
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
 
-    call_timeout = httpx.Timeout(connect=3.0, read=float(timeout), write=10.0, pool=5.0)
+    call_timeout = httpx.Timeout(connect=_connect_timeout_for(target_url), read=float(timeout), write=10.0, pool=5.0)
     attempt = 0
     while attempt < max_retries:
         attempt += 1
@@ -1536,9 +1570,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
 
-    # Short connect timeout: a reachable peer answers SYN in <100ms even on
-    # Tailscale. 3s is plenty; 30s let one dead upstream wedge the UI.
-    stream_timeout = httpx.Timeout(connect=3.0, read=float(timeout), write=30.0, pool=5.0)
+    # Connect budget is host-aware: tight for local/Tailscale peers (they answer
+    # the SYN in <100ms), forgiving for public cloud hosts whose cold TLS
+    # handshake can exceed 3s — see _connect_timeout_for.
+    stream_timeout = httpx.Timeout(connect=_connect_timeout_for(target_url), read=float(timeout), write=30.0, pool=5.0)
 
     if _is_host_dead(target_url):
         yield f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n'
