@@ -486,6 +486,7 @@ function _getDatePickerValue(containerId) {
 
 const _CATEGORY_MAP = {
   // action -> category
+  notify_summary:       'Notify',
   tidy_sessions:        'Chats',
   tidy_documents:       'Documents',
   consolidate_memory:   'Memory',

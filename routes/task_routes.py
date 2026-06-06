@@ -1017,6 +1017,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
         """List available event triggers."""
         _owner(request)
         return {"events": [
+            {"name": "agent_turn_end", "description": "Fires after the agent finishes a multi-step turn (≥2 rounds or used a tool)"},
             {"name": "session_created", "description": "Fires when a new chat session is created"},
             {"name": "message_sent", "description": "Fires when a user sends a message"},
             {"name": "document_created", "description": "Fires when a document is created"},

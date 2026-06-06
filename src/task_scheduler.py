@@ -949,6 +949,7 @@ class TaskScheduler:
     # content) — don't pollute the assistant chat session with their summaries.
     # Activity log + reminder email already carry everything the user needs.
     _SILENT_ACTIONS = frozenset({
+        "notify_summary",  # delivers its own push; nothing to write to a session
         "check_email_urgency",
         "learn_sender_signatures",
         "summarize_emails",

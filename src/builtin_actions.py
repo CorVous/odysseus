@@ -2203,8 +2203,85 @@ async def action_cookbook_serve(
     return f"Launched {repo_id} (session {sid})", True
 
 
+async def action_notify_summary(owner: str, task_name: str = "", progress_cb=None, **kwargs) -> Tuple[str, bool]:
+    """Push a short summary of the just-finished chat's last assistant message.
+
+    Fired by a task with trigger_event="agent_turn_end" so the user gets a
+    "your agent is done" notification with a one-line summary once it has done
+    real work. The assistant message is persisted BEFORE the event fires, so we
+    read the owner's most-recently-updated normal chat and summarize its last
+    assistant turn. Delivery uses the configured reminder channel (ntfy/email/
+    browser) via dispatch_reminder. Silent (no session write) — see
+    TaskScheduler._SILENT_ACTIONS."""
+    from core.database import SessionLocal, Session as DBSession, ChatMessage
+    db = SessionLocal()
+    try:
+        q = db.query(DBSession).filter(DBSession.archived == False)  # noqa: E712
+        q = owner_filter(q, DBSession, owner, include_shared=True)
+        sess = q.order_by(DBSession.updated_at.desc()).first()
+        if not sess:
+            raise TaskNoop("notify_summary: no session for owner")
+        if (sess.name or "").startswith("[Task]"):
+            # Don't notify about our own task-output sessions.
+            raise TaskNoop("notify_summary: latest session is a task session")
+        last = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == sess.id, ChatMessage.role == "assistant")
+            .order_by(ChatMessage.timestamp.desc())
+            .first()
+        )
+        if not last or not (last.content or "").strip():
+            raise TaskNoop("notify_summary: no assistant message to summarize")
+        msg_text = last.content
+        sess_name = (sess.name or "Chat").strip()
+        sess_id, msg_id = sess.id, last.id
+    finally:
+        db.close()
+
+    # Short messages go as-is; longer ones get one quick LLM summary.
+    body = msg_text.strip()
+    if len(body) > 280:
+        try:
+            from src.task_endpoint import resolve_task_endpoint
+            from src.llm_core import llm_call_async
+            from src.text_helpers import strip_think
+            url, model, headers = resolve_task_endpoint(owner=owner)
+            if url and model:
+                raw = await llm_call_async(
+                    url, model,
+                    [
+                        {"role": "system", "content": "Summarize the assistant's message below in 1-2 short sentences for a phone notification. Plain text only — no preamble, no markdown, no quotes."},
+                        {"role": "user", "content": msg_text[:8000]},
+                    ],
+                    # 4096, not a few hundred: a reasoning model spends its budget
+                    # on <think> before emitting the summary, so a small cap yields
+                    # an empty result and we'd fall back to the raw head.
+                    temperature=0.3, max_tokens=4096, headers=headers, timeout=120,
+                    background=True,
+                )
+                s = strip_think(raw or "", prose=True, prompt_echo=True).strip()
+                if s:
+                    body = s
+        except Exception as e:
+            logger.warning("notify_summary: summarization failed, sending head: %s", e)
+            body = body[:280]
+    if len(body) > 300:
+        body = body[:300].rstrip() + "…"
+
+    from routes.note_routes import dispatch_reminder
+    res = await dispatch_reminder(
+        title=f"✅ {sess_name}", note_body=body,
+        note_id=f"agent_turn:{sess_id}:{msg_id}", owner=owner,
+    )
+    if res.get("skipped"):
+        return (f"Finish summary for '{sess_name}' already sent recently (deduped)", True)
+    sent = bool(res.get("ntfy_sent") or res.get("email_sent") or res.get("browser_sent"))
+    return (f"Sent finish summary for '{sess_name}'", sent)
+
+
 BUILTIN_ACTIONS = {
     "tidy_sessions": action_tidy_sessions,
+    "notify_summary": action_notify_summary,
     "tidy_documents": action_tidy_documents,
     "consolidate_memory": action_consolidate_memory,
     "tidy_research": action_tidy_research,
@@ -2229,6 +2306,7 @@ BUILTIN_ACTIONS = {
 # Descriptions for the UI/API
 BUILTIN_ACTION_INFO = {
     "tidy_sessions": "Clean up empty chat sessions and auto-sort into folders",
+    "notify_summary": "Push a 1-2 sentence summary of the chat's last message as a notification (pair with the agent_turn_end trigger to ping you when the agent finishes its work)",
     "tidy_documents": "Remove junk/empty documents",
     "consolidate_memory": "Remove duplicate memories",
     "tidy_research": "Remove orphaned research files (sessions that were deleted)",

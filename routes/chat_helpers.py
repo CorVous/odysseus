@@ -1089,3 +1089,14 @@ def run_post_response_tasks(
     # Auto-name
     if needs_auto_name(sess.name):
         asyncio.create_task(auto_name_session(session_manager, sess))
+
+    # End-of-agent-turn event. Lets opt-in tasks (e.g. a notify_summary task with
+    # trigger_event="agent_turn_end") ping the user once the agent has actually
+    # done multi-step work. No-op unless such a task exists. Gated to substantial
+    # turns (>=2 rounds OR used a tool) so quick one-shot replies don't notify.
+    if not incognito and not compare_mode and (agent_rounds >= 2 or agent_tool_calls >= 1):
+        try:
+            from src.event_bus import fire_event
+            fire_event("agent_turn_end", owner)
+        except Exception:
+            logger.debug("agent_turn_end event dispatch failed", exc_info=True)
