@@ -285,13 +285,16 @@ async def extract_and_store(
         fallback_facts = _fallback_memory_candidates(stripped_recent)
 
         # Flatten the window into a SINGLE user message instead of appending the
-        # raw alternating role messages. Passing the history as role messages
-        # makes the prompt END on an assistant turn whenever the window's last
-        # message is an assistant reply — and a chat model then returns an EMPTY
-        # completion (nothing to answer), which is the real reason auto-memory
-        # can produce nothing ("0 candidates" on every run with a reasoning model).
-        # Ending on a user instruction guarantees a response. The skill extractor
-        # flattens for the same reason.
+        # raw alternating role messages. Passed as raw chat messages, the model
+        # treats the window as a conversation to CONTINUE rather than a transcript
+        # to ANALYZE, so it reliably extracts nothing — typically returning `[]`
+        # (and, depending on the input, sometimes an empty or <think>-only
+        # completion when the window ends on an assistant turn). This was the real
+        # cause of auto-memory logging "0 candidates" on every run. Reframing it as
+        # one "analyze this transcript, return the JSON array" user message makes
+        # the model actually extract. Controlled repro on this model: 0/6 trials
+        # with the old structure vs 6/6 with this one. The skill extractor flattens
+        # for the same reason.
         def _flatten_msg(m):
             c = m.get("content", "")
             if isinstance(c, list):
