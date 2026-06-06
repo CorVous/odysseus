@@ -78,7 +78,17 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
                     parsed = urlparse(base)
                     host = (parsed.hostname or "").lower()
                     path = (parsed.path or "").rstrip("/")
-                    if parsed.port != 11434 and "ollama" not in host and (path.endswith("/v1") or "/openai" in path):
+                    # A loopback / private / Tailscale (100.x) host is a self-hosted
+                    # server (LM Studio, llama.cpp, vLLM) even when it has an api_key
+                    # set and serves on /v1. Do NOT auto-classify it as a remote
+                    # proxy — that skips the local context-window probe and falls
+                    # back to the known-table guess (e.g. qwen3->131072) instead of
+                    # the server's real loaded window (LM Studio /api/v0/models).
+                    is_private_host = (host in _LOCAL_HOSTS or _is_private_ip_literal(host)
+                                       or _in_tailscale_range(host))
+                    if (not is_private_host and parsed.port != 11434
+                            and "ollama" not in host
+                            and (path.endswith("/v1") or "/openai" in path)):
                         return "proxy"
                 return "auto"
         finally:
