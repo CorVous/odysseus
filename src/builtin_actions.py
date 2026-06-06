@@ -2270,7 +2270,7 @@ async def action_notify_summary(owner: str, task_name: str = "", progress_cb=Non
 
     from routes.note_routes import dispatch_reminder
     res = await dispatch_reminder(
-        title=f"✅ {sess_name}", note_body=body,
+        title=f"Done: {sess_name}", note_body=body,
         note_id=f"agent_turn:{sess_id}:{msg_id}", owner=owner,
     )
     if res.get("skipped"):
