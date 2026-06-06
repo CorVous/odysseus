@@ -341,7 +341,9 @@ async def extract_and_store(
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             # JSON may still be embedded in surrounding commentary — slice from
-            # the first '[' to the last ']' (extraction returns a list).
+            # the first '[' to the last ']' (extraction returns a list). Leading
+            # whitespace and <think>/prose blocks were already stripped above, so
+            # this only handles trailing/leading commentary the model left in place.
             if text and text[0] != "[":
                 _start = text.find("[")
                 _end = text.rfind("]")
