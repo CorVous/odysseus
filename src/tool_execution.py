@@ -758,7 +758,12 @@ async def _direct_fallback(
                                 n += 1
                                 budget -= len(line)
                                 if budget <= 0:
-                                    out.append(f"\n... [truncated at {MAX_READ_CHARS} chars]")
+                                    out.append(
+                                        f"\n... [truncated at {MAX_READ_CHARS} chars — this is NOT "
+                                        f"the full file. More lines remain. To read the rest, call "
+                                        f"read_file again with offset={i + 1} (advance offset each "
+                                        f"call until no truncation notice appears).]"
+                                    )
                                     break
                         return "".join(out)
                     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -773,7 +778,17 @@ async def _direct_fallback(
             except OSError as e:
                 return {"error": f"read_file: {path}: {e}", "exit_code": 1}
             if not (offset > 0 or limit > 0) and len(data) > MAX_READ_CHARS:
-                data = data[:MAX_READ_CHARS] + f"\n... [truncated at {MAX_READ_CHARS} chars]"
+                kept = data[:MAX_READ_CHARS]
+                # 1-based line to resume from: re-reading the (possibly partial)
+                # last shown line in full leaves no gap.
+                next_line = kept.count("\n") + 1
+                data = (
+                    kept
+                    + f"\n... [truncated at {MAX_READ_CHARS} chars — this is NOT the full file. "
+                    f"To read the rest, call read_file again with offset={next_line} (1-based "
+                    f"line), and repeat advancing offset until no truncation notice appears.]"
+                )
+                return {"output": data, "exit_code": 0, "next_offset": next_line, "truncated": True}
             return {"output": data, "exit_code": 0}
 
         if tool == "write_file":

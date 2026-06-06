@@ -82,7 +82,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from disk. Optionally read a line range with offset/limit for large files.",
+            "description": "Read a file from disk. A single call returns at most ~20,000 chars; larger files are truncated. To read a whole large file, page it: read with offset/limit, then call again with offset advanced past what you've read, repeating until the result has no truncation notice.",
             "parameters": {
                 "type": "object",
                 "properties": {
