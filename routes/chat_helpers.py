@@ -27,8 +27,12 @@ logger = logging.getLogger(__name__)
 
 def _format_tool_recap(events: list, char_budget: int) -> str:
     """Compact ``[tool] command (exit N) -> output-head`` lines from saved
-    tool_events, kept under ``char_budget`` (≈4 chars/token). Each output head
-    is capped so one huge event can't crowd out the rest of the turn."""
+    tool_events, kept under ``char_budget`` (≈4 chars/token). Prefers each
+    event's ``replay_output`` (a larger head persisted for replay) over the ~2k
+    display ``output``. No fixed per-event cap — each body is already bounded at
+    save time (agent_tool_result_replay_max_chars) and the running ``char_budget``
+    truncates the tail, so a single huge event can still only fill the remaining
+    budget, not exceed it."""
     lines = []
     used = 0
     for ev in events or []:
@@ -36,11 +40,11 @@ def _format_tool_recap(events: list, char_budget: int) -> str:
             break
         tool = ev.get("tool", "?")
         cmd = (ev.get("command") or "").strip()
-        out = (ev.get("output") or "").strip()
+        out = (ev.get("replay_output") or ev.get("output") or "").strip()
         rc = ev.get("exit_code")
         head = f"[{tool}] {cmd}" if cmd else f"[{tool}]"
         rc_s = f" (exit {rc})" if rc not in (None, 0) else ""
-        body = out if len(out) <= 1000 else out[:1000] + " …"
+        body = out
         entry = f"{head}{rc_s}\n-> {body or '(no output)'}"
         if used + len(entry) > char_budget:
             entry = entry[: max(0, char_budget - used)].rstrip()
@@ -58,19 +62,22 @@ def _inject_recent_tool_results(messages: list, max_turns: int, token_budget: in
     For the most recent ``max_turns`` assistant messages that carry saved
     ``tool_events`` (newest first), append a compact record of what they ran +
     returned to that message's ``content``, bounded by ``token_budget`` total.
-    Folded into the existing assistant message (not separate tool messages) so it
-    can never violate the provider's tool_use/tool_result pairing rule. Only the
-    per-request ``messages`` copies are mutated — saved history / display are
-    untouched. No-op when disabled (turns/budget <= 0) or in chat mode (no
-    tool_events). Note: replays the ≤2k-char output heads saved at turn time, not
-    untruncated results (Odysseus doesn't persist those)."""
-    if max_turns <= 0 or token_budget <= 0:
+    ``max_turns <= 0`` means UNBOUNDED — replay as far back as the token budget
+    allows (the budget, not the turn count, is then the limiter). Folded into the
+    existing assistant message (not separate tool messages) so it can never
+    violate the provider's tool_use/tool_result pairing rule. Only the per-request
+    ``messages`` copies are mutated — saved history / display are untouched. No-op
+    when the budget is <= 0 (the disable switch) or in chat mode (no tool_events).
+    Note: replays the ≤2k-char output heads saved at turn time, not untruncated
+    results (Odysseus doesn't persist those)."""
+    if token_budget <= 0:
         return
+    unlimited_turns = max_turns <= 0
     spent_chars = 0
     char_budget = token_budget * 4
     turns_done = 0
     for msg in reversed(messages):
-        if turns_done >= max_turns or spent_chars >= char_budget:
+        if (not unlimited_turns and turns_done >= max_turns) or spent_chars >= char_budget:
             break
         if msg.get("role") != "assistant":
             continue
@@ -87,6 +94,38 @@ def _inject_recent_tool_results(messages: list, max_turns: int, token_budget: in
         )
         msg["content"] = (msg.get("content") or "") + block
         spent_chars += len(block)
+
+
+def _usable_input_context(sess) -> int:
+    """Best-effort estimate of the usable input-token budget for this turn — the
+    same value the agent loop soft-trims the prompt to
+    (``compute_input_token_budget``: the explicit ``agent_input_token_budget``
+    clamped to the window, or the auto-scaled default). The replay budget is a
+    fraction of THIS, so it scales with the model/window instead of being a fixed
+    token count. Returns 0 when it can't be resolved so callers can skip replay
+    rather than guess."""
+    try:
+        from src.context_budget import compute_input_token_budget, DEFAULT_HARD_MAX
+        from src.model_context import get_context_length
+        from src.settings import get_setting, is_setting_overridden
+
+        ctx_len = get_context_length(sess.endpoint_url, sess.model)
+        soft = int(get_setting("agent_input_token_budget", 6000) or 0)
+        if soft <= 0:
+            # Budget disabled → "usable" is the raw window (or unknown).
+            return ctx_len if ctx_len > 0 else 0
+        try:
+            hard_max = int(get_setting("agent_input_token_hard_max", DEFAULT_HARD_MAX) or DEFAULT_HARD_MAX)
+        except (TypeError, ValueError):
+            hard_max = DEFAULT_HARD_MAX
+        if hard_max <= 0:
+            hard_max = DEFAULT_HARD_MAX
+        return compute_input_token_budget(
+            soft, ctx_len, is_setting_overridden("agent_input_token_budget"), hard_max=hard_max,
+        )
+    except Exception as e:
+        logger.warning("[agent] usable-context resolve for replay failed: %s", e)
+        return 0
 
 
 # ── Data containers ────────────────────────────────────────────────────── #
@@ -710,8 +749,17 @@ async def build_chat_context(
     # stay as plain prose) is the mainstream pattern for context-limited models.
     if agent_mode:
         from src.settings import get_setting
+        # turns: 0 = unbounded (budget is the limiter). budget: a fraction of the
+        # usable input context (see _usable_input_context), so it scales with the
+        # model/window. pct <= 0 disables replay.
         _replay_turns = int(get_setting("agent_tool_result_replay_turns", 2) or 0)
-        _replay_budget = int(get_setting("agent_tool_result_replay_token_budget", 6000) or 0)
+        try:
+            _replay_pct = float(get_setting("agent_tool_result_replay_context_pct", 0.05) or 0.0)
+        except (TypeError, ValueError):
+            _replay_pct = 0.0
+        _replay_pct = max(0.0, min(_replay_pct, 1.0))
+        _usable = _usable_input_context(sess) if _replay_pct > 0 else 0
+        _replay_budget = int(_usable * _replay_pct)
         _inject_recent_tool_results(messages, _replay_turns, _replay_budget)
 
     # Auto-compact

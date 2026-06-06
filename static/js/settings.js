@@ -1560,6 +1560,9 @@ async function initAgentSettings() {
   var toolsInput = el('set-agentMaxTools');
   var roundsInput = el('set-agentMaxRounds');
   var supInput = el('set-agentSupervisorLadder');
+  var replayTurnsInput = el('set-agentReplayTurns');
+  var replayPctInput = el('set-agentReplayPct');
+  var replayMaxCharsInput = el('set-agentReplayMaxChars');
   var msg = el('set-agentMsg');
   if (!toolsInput) return;
 
@@ -1569,6 +1572,13 @@ async function initAgentSettings() {
     if (settings.agent_max_tool_calls) toolsInput.value = settings.agent_max_tool_calls;
     if (roundsInput && settings.agent_max_rounds) roundsInput.value = settings.agent_max_rounds;
     if (supInput) supInput.checked = !!settings.agent_supervisor_ladder;
+    if (replayTurnsInput && settings.agent_tool_result_replay_turns != null)
+      replayTurnsInput.value = settings.agent_tool_result_replay_turns;
+    // Stored as a fraction (0.05); shown to the user as a percent (5).
+    if (replayPctInput && settings.agent_tool_result_replay_context_pct != null)
+      replayPctInput.value = +(settings.agent_tool_result_replay_context_pct * 100).toFixed(2);
+    if (replayMaxCharsInput && settings.agent_tool_result_replay_max_chars != null)
+      replayMaxCharsInput.value = settings.agent_tool_result_replay_max_chars;
   } catch (e) {}
 
   // Clamp + coerce a raw input to an int in [lo, hi]; falls back to `dflt`
@@ -1578,34 +1588,69 @@ async function initAgentSettings() {
     if (isNaN(n)) return dflt;
     return Math.max(lo, Math.min(n, hi));
   }
+  // Same, for a float (used by the replay percent input).
+  function clampFloat(raw, lo, hi, dflt) {
+    var n = parseFloat(raw);
+    if (isNaN(n)) return dflt;
+    return Math.max(lo, Math.min(n, hi));
+  }
 
   async function save() {
     var tools = clampInt(toolsInput.value, 0, 1000, 0);
     var rounds = roundsInput ? clampInt(roundsInput.value, 1, 200, 20) : null;
+    var rTurns = replayTurnsInput ? clampInt(replayTurnsInput.value, 0, 200, 2) : null;
+    var rPctUi = replayPctInput ? clampFloat(replayPctInput.value, 0, 100, 5) : null;
+    var rMaxChars = replayMaxCharsInput ? clampInt(replayMaxCharsInput.value, 0, 200000, 8000) : null;
     toolsInput.value = tools;                       // reflect the clamped value
     if (roundsInput) roundsInput.value = rounds;
+    if (replayTurnsInput) replayTurnsInput.value = rTurns;
+    if (replayPctInput) replayPctInput.value = rPctUi;
+    if (replayMaxCharsInput) replayMaxCharsInput.value = rMaxChars;
     var payload = { agent_max_tool_calls: tools };
     if (rounds != null) payload.agent_max_rounds = rounds;
     if (supInput) payload.agent_supervisor_ladder = !!supInput.checked;
+    if (rTurns != null) payload.agent_tool_result_replay_turns = rTurns;
+    if (rPctUi != null) payload.agent_tool_result_replay_context_pct = rPctUi / 100;  // store as fraction
+    if (rMaxChars != null) payload.agent_tool_result_replay_max_chars = rMaxChars;
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      msg.textContent = (tools > 0 ? 'Limit: ' + tools + ' tool calls' : 'Unlimited tool calls') +
-        (rounds != null ? ' · ' + rounds + ' steps/message' : '') +
+      msg.textContent = statusText(tools, rounds, rTurns, rPctUi) +
         (supInput && supInput.checked ? ' · supervisor on' : '');
       msg.style.color = 'var(--fg)';
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
+  // One-line summary of the current agent limits, including how tool-result
+  // replay resolves (off / N turns / all turns) and its context share.
+  function statusText(tools, rounds, rTurns, rPctUi) {
+    var parts = [];
+    parts.push(tools > 0 ? 'Limit: ' + tools + ' tool calls' : 'Unlimited tool calls');
+    if (rounds != null) parts.push(rounds + ' steps/message');
+    if (rPctUi != null) {
+      if (rPctUi <= 0) {
+        parts.push('replay off');
+      } else {
+        var turnTxt = (rTurns === 0) ? 'all turns' : (rTurns + ' turn' + (rTurns === 1 ? '' : 's'));
+        parts.push('replay ' + turnTxt + ' @ ' + rPctUi + '% ctx');
+      }
+    }
+    return parts.join(' · ');
+  }
+
   toolsInput.addEventListener('change', save);
   if (roundsInput) roundsInput.addEventListener('change', save);
   if (supInput) supInput.addEventListener('change', save);
+  if (replayTurnsInput) replayTurnsInput.addEventListener('change', save);
+  if (replayPctInput) replayPctInput.addEventListener('change', save);
+  if (replayMaxCharsInput) replayMaxCharsInput.addEventListener('change', save);
   var cur = parseInt(toolsInput.value, 10) || 0;
   var curR = roundsInput ? (parseInt(roundsInput.value, 10) || 20) : null;
-  msg.textContent = (cur > 0 ? 'Limit: ' + cur + ' tool calls' : 'Unlimited tool calls') +
-    (curR != null ? ' · ' + curR + ' steps/message' : '') +
+  var curRT = replayTurnsInput ? (parseInt(replayTurnsInput.value, 10) || 0) : null;
+  var curRP = replayPctInput ? (parseFloat(replayPctInput.value) || 0) : null;
+  msg.textContent = statusText(cur, curR, curRT, curRP) +
     (supInput && supInput.checked ? ' · supervisor on' : '');
 }
 

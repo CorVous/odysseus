@@ -2202,6 +2202,18 @@
                 <label class="settings-label">Max steps per message</label>
                 <input id="set-agentMaxRounds" type="text" inputmode="numeric" placeholder="20" class="settings-select" style="width:120px;">
               </div>
+              <div class="settings-row">
+                <label class="settings-label">Tool-result replay turns</label>
+                <input id="set-agentReplayTurns" type="text" inputmode="numeric" placeholder="0 = all turns" class="settings-select" style="width:120px;">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label">Replay context budget (%)</label>
+                <input id="set-agentReplayPct" type="text" inputmode="decimal" placeholder="0 = off" class="settings-select" style="width:120px;">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label">Max replay output / tool (chars)</label>
+                <input id="set-agentReplayMaxChars" type="text" inputmode="numeric" placeholder="8000" class="settings-select" style="width:120px;">
+              </div>
               <div id="set-agentMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
             </div>
           </div>

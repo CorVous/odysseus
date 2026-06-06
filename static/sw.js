@@ -7,7 +7,10 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v327';
+// v328: overhaul tool-result replay knobs in Agent settings (replay turns,
+//       0=all; replay budget as a % of usable context, replacing the fixed token
+//       budget; per-tool max-replay-chars head so replay restores >2k).
+const CACHE_NAME = 'odysseus-v328';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
