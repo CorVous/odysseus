@@ -764,11 +764,13 @@ async def _direct_fallback(
                                         f"read_file again with offset={i + 1} (advance offset each "
                                         f"call until no truncation notice appears).]"
                                     )
-                                    break
-                        return "".join(out)
+                                    # Return the resume line so the caller gets the
+                                    # same structured next_offset as the full-read path.
+                                    return "".join(out), i + 1
+                        return "".join(out), None
                     with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        return f.read(MAX_READ_CHARS + 1)
-                data = await asyncio.to_thread(_read)
+                        return f.read(MAX_READ_CHARS + 1), None
+                data, lr_next_offset = await asyncio.to_thread(_read)
             except FileNotFoundError:
                 return {"error": f"read_file: {path}: not found", "exit_code": 1}
             except PermissionError:
@@ -789,6 +791,10 @@ async def _direct_fallback(
                     f"line), and repeat advancing offset until no truncation notice appears.]"
                 )
                 return {"output": data, "exit_code": 0, "next_offset": next_line, "truncated": True}
+            if lr_next_offset is not None:
+                # Line-range read hit the char budget — surface the same structured
+                # next_offset/truncated signal as the full-read path above.
+                return {"output": data, "exit_code": 0, "next_offset": lr_next_offset, "truncated": True}
             return {"output": data, "exit_code": 0}
 
         if tool == "write_file":
