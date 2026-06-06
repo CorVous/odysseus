@@ -839,8 +839,14 @@ def _build_system_prompt(
     compact: bool = False,
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
+    cache_mode: bool = False,
 ) -> List[Dict]:
-    """Build agent system prompt, inject MCP/document context, merge consecutive system msgs."""
+    """Build agent system prompt, inject MCP/document context, merge consecutive system msgs.
+
+    When ``cache_mode`` is on, the per-turn date and any ``metadata.cache_dynamic``
+    preface messages (retrieved memories / RAG / web) are kept OUT of the stable
+    prefix and relocated to the dynamic tail just before the current user message,
+    so the system block + history prefix stays byte-stable for KV-cache reuse."""
     global _cached_base_prompt, _cached_base_prompt_key
     if suppress_local_context:
         active_document = None
@@ -1226,23 +1232,34 @@ def _build_system_prompt(
         else:
             merged.append(msg)
 
-    # Insert the document message right before the last user message so it's
-    # close to the user's request and survives context trimming independently.
-    # Same treatment for the matched-skills block — user-editable skill
-    # content must never be in the system role (see _skills_message above).
-    last_user_idx = len(merged) - 1
-    for i in range(len(merged) - 1, -1, -1):
-        if merged[i].get("role") == "user":
-            last_user_idx = i
-            break
+    # Build the dynamic tail and insert it right before the last user message so
+    # it's close to the user's request and survives context trimming independently.
+    # The document + matched-skills blocks are tail-inserted regardless (user-
+    # editable skill content must never be in the system role; see above). In
+    # cache mode the per-turn date + every metadata.cache_dynamic preface message
+    # (retrieved memories / RAG / web) are ALSO pulled out of the prefix and
+    # appended here, leaving a byte-stable system+history prefix for KV reuse.
+    tail = []
+    if cache_mode:
+        if _datetime_message:
+            tail.append(_datetime_message)
+        dyn = [m for m in merged if (m.get("metadata") or {}).get("cache_dynamic")]
+        merged = [m for m in merged if not (m.get("metadata") or {}).get("cache_dynamic")]
+        tail.extend(dyn)
     if _doc_message:
-        merged.insert(last_user_idx, _doc_message)
-        last_user_idx += 1  # the document message is now at last_user_idx
+        tail.append(_doc_message)
     if _skills_message:
-        merged.insert(last_user_idx, _skills_message)
-        last_user_idx += 1
-    if _datetime_message:
-        merged.insert(last_user_idx, _datetime_message)
+        tail.append(_skills_message)
+    if not cache_mode and _datetime_message:
+        tail.append(_datetime_message)
+
+    if tail:
+        last_user_idx = len(merged) - 1
+        for i in range(len(merged) - 1, -1, -1):
+            if merged[i].get("role") == "user":
+                last_user_idx = i
+                break
+        merged[last_user_idx:last_user_idx] = tail
 
     return merged, mcp_schemas
 
@@ -2012,6 +2029,11 @@ async def stream_agent_loop(
         _is_api_model = False
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
+    # Prompt-cache mode: preserve full context + restructure into a byte-stable
+    # prefix (static system + append-only history) so llama.cpp/LM Studio can
+    # reuse the KV cache across turns. Read once; threaded to the prompt builder,
+    # the soft-trim, and the tool-output persistence below.
+    _cache_mode = bool(get_setting("agent_prompt_cache_mode", False))
     messages, mcp_schemas = _build_system_prompt(
         messages, model, active_document, mcp_mgr, disabled_tools,
         needs_admin=_needs_admin, relevant_tools=_relevant_tools,
@@ -2019,6 +2041,7 @@ async def stream_agent_loop(
         compact=_is_api_model,
         owner=owner,
         suppress_local_context=guide_only,
+        cache_mode=_cache_mode,
     )
     if plan_mode and not guide_only:
         # Steer the model to investigate-then-propose. Hard tool gating handles
@@ -2077,6 +2100,13 @@ async def stream_agent_loop(
                 is_setting_overridden("agent_input_token_budget"),
                 hard_max=hard_max,
             )
+            # Prompt-cache mode preserves the full transcript: never apply the
+            # soft (170k-ish) budget, which would front-trim and shift the cached
+            # prefix. Trim ONLY at the real context window so the request can't
+            # overflow; when it does fire here the prefix shifts (unavoidable) so
+            # log it as a cache-busting event.
+            if _cache_mode and context_length > 0:
+                effective_budget = max(effective_budget, context_length - reserve_tokens)
             trimmed_messages = trim_for_context(
                 messages,
                 effective_budget,
@@ -2085,7 +2115,8 @@ async def stream_agent_loop(
             after_trim_tokens = estimate_tokens(trimmed_messages)
             if after_trim_tokens < before_trim_tokens:
                 logger.info(
-                    "[agent] soft-trimmed context: %s -> %s tokens (budget=%s, reserve=%s)",
+                    "[agent]%s trimmed context: %s -> %s tokens (budget=%s, reserve=%s)",
+                    " [cache-mode window-ceiling — prefix shifted, KV cache busted]" if _cache_mode else " soft-",
                     before_trim_tokens,
                     after_trim_tokens,
                     effective_budget,
@@ -2115,6 +2146,11 @@ async def stream_agent_loop(
         _replay_persist_chars = 8000
     if _replay_persist_chars < 0:
         _replay_persist_chars = 0
+    # Prompt-cache mode preserves EVERYTHING: persist the full untruncated tool
+    # output (effectively uncapped) so the replayed history is complete. Grows
+    # data/app.db per turn — the accepted cost of full fidelity.
+    if _cache_mode:
+        _replay_persist_chars = 10_000_000
     round_texts = []   # Cleaned text per round for history reload
     # Completion-verifier state (mechanism 3a). _effectful_used flips on when
     # a tool that produces a checkable artifact runs; the verifier only fires
@@ -2968,6 +3004,34 @@ async def stream_agent_loop(
         backend_prefill_tps=backend_prefill_tps,
     )
     metrics["requested_model"] = requested_model
+
+    # Prefill / KV-cache visibility. With prompt-cache mode the backend reuses the
+    # KV prefix, so the EFFECTIVE prefill rate (prompt tokens / model wait) spikes
+    # on a hit — measured ~25k tok/s warm vs ~500 tok/s cold on this model. Logged
+    # per turn so "did this turn hit the cache?" is answerable from server.log
+    # without probing the backend. cache=HIT/MISS is a heuristic (only meaningful
+    # once the prompt is large enough for prefill to dominate the wait).
+    try:
+        _ptoks = metrics.get("input_tokens") or 0
+        _wait = metrics.get("agent_model_wait_time") or metrics.get("time_to_first_token") or 0
+        _eff = round(_ptoks / _wait) if _wait > 0 else 0
+        if _ptoks < 4000:
+            _hint = "?(small)"
+        elif _eff >= 3000:
+            _hint = "HIT"
+        elif _eff < 1200:
+            _hint = "MISS"
+        else:
+            _hint = "?"
+        logger.info(
+            "[agent] prefill: cache_mode=%s prompt_tokens=%s ttft=%ss model_wait=%ss "
+            "eff_prefill=%s tok/s backend_prefill_tps=%s gen_tps=%s -> cache=%s",
+            _cache_mode, _ptoks, metrics.get("time_to_first_token"), round(_wait, 2),
+            _eff, metrics.get("prefill_tps"), metrics.get("tokens_per_second"), _hint,
+        )
+    except Exception:
+        pass
+
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.

@@ -544,6 +544,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             # 0 disables replay.
             "agent_tool_result_replay_context_pct": (0.0, 1.0),
         }
+        _BOOL_KEYS = {"agent_prompt_cache_mode"}
         for key in DEFAULT_SETTINGS:
             if key not in body:
                 continue
@@ -562,6 +563,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"{key} must be a number")
                 val = max(lo, min(val, hi))
+            elif key in _BOOL_KEYS:
+                # Accept JSON true/false plus common string/int forms from the UI.
+                if isinstance(val, str):
+                    val = val.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    val = bool(val)
             current[key] = val
         _save_settings(current)
         return current

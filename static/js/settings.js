@@ -1563,6 +1563,7 @@ async function initAgentSettings() {
   var replayTurnsInput = el('set-agentReplayTurns');
   var replayPctInput = el('set-agentReplayPct');
   var replayMaxCharsInput = el('set-agentReplayMaxChars');
+  var cacheModeInput = el('set-agentCacheMode');
   var msg = el('set-agentMsg');
   if (!toolsInput) return;
 
@@ -1579,6 +1580,7 @@ async function initAgentSettings() {
       replayPctInput.value = +(settings.agent_tool_result_replay_context_pct * 100).toFixed(2);
     if (replayMaxCharsInput && settings.agent_tool_result_replay_max_chars != null)
       replayMaxCharsInput.value = settings.agent_tool_result_replay_max_chars;
+    if (cacheModeInput) cacheModeInput.checked = !!settings.agent_prompt_cache_mode;
   } catch (e) {}
 
   // Clamp + coerce a raw input to an int in [lo, hi]; falls back to `dflt`
@@ -1601,6 +1603,7 @@ async function initAgentSettings() {
     var rTurns = replayTurnsInput ? clampInt(replayTurnsInput.value, 0, 200, 2) : null;
     var rPctUi = replayPctInput ? clampFloat(replayPctInput.value, 0, 100, 5) : null;
     var rMaxChars = replayMaxCharsInput ? clampInt(replayMaxCharsInput.value, 0, 200000, 8000) : null;
+    var cacheMode = cacheModeInput ? !!cacheModeInput.checked : null;
     toolsInput.value = tools;                       // reflect the clamped value
     if (roundsInput) roundsInput.value = rounds;
     if (replayTurnsInput) replayTurnsInput.value = rTurns;
@@ -1612,6 +1615,8 @@ async function initAgentSettings() {
     if (rTurns != null) payload.agent_tool_result_replay_turns = rTurns;
     if (rPctUi != null) payload.agent_tool_result_replay_context_pct = rPctUi / 100;  // store as fraction
     if (rMaxChars != null) payload.agent_tool_result_replay_max_chars = rMaxChars;
+    if (cacheMode != null) payload.agent_prompt_cache_mode = cacheMode;
+    reflectCacheMode(cacheMode);
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -1640,12 +1645,25 @@ async function initAgentSettings() {
     return parts.join(' · ');
   }
 
+  // When cache mode is on it overrides the three replay knobs — dim them so the
+  // user isn't tuning values that won't apply.
+  function reflectCacheMode(on) {
+    [replayTurnsInput, replayPctInput, replayMaxCharsInput].forEach(function (inp) {
+      if (!inp) return;
+      inp.disabled = !!on;
+      inp.style.opacity = on ? '0.45' : '';
+      inp.title = on ? 'Ignored while Prompt-cache mode is on (it preserves the full context)' : '';
+    });
+  }
+
   toolsInput.addEventListener('change', save);
   if (roundsInput) roundsInput.addEventListener('change', save);
   if (supInput) supInput.addEventListener('change', save);
   if (replayTurnsInput) replayTurnsInput.addEventListener('change', save);
   if (replayPctInput) replayPctInput.addEventListener('change', save);
   if (replayMaxCharsInput) replayMaxCharsInput.addEventListener('change', save);
+  if (cacheModeInput) cacheModeInput.addEventListener('change', save);
+  reflectCacheMode(cacheModeInput ? cacheModeInput.checked : false);
   var cur = parseInt(toolsInput.value, 10) || 0;
   var curR = roundsInput ? (parseInt(roundsInput.value, 10) || 20) : null;
   var curRT = replayTurnsInput ? (parseInt(replayTurnsInput.value, 10) || 0) : null;

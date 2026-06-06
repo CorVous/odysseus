@@ -12,6 +12,18 @@ from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_mess
 
 logger = logging.getLogger(__name__)
 
+
+def _mark_cache_dynamic(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Tag a preface message as PER-TURN DYNAMIC so prompt-cache mode can relocate
+    it from the prefix (before history) to the dynamic tail (after history, near
+    the current user message), keeping the cacheable prefix byte-stable. Harmless
+    metadata otherwise — only agent_loop's cache-mode relocation reads it.
+    See src/agent_loop._build_system_prompt and routes/chat_helpers.build_chat_context."""
+    md = msg.setdefault("metadata", {})
+    md["cache_dynamic"] = True
+    return msg
+
+
 # ── Stopwords & tokenizer ──
 
 _STOPWORDS = frozenset(
@@ -227,13 +239,13 @@ class ChatProcessor:
                 relevant = self._hybrid_retrieve(message, extended, k=3)
                 if relevant:
                     ext_text = "\n".join([f"- {m['text']}" for m in relevant])
-                    preface.append(untrusted_context_message(
+                    preface.append(_mark_cache_dynamic(untrusted_context_message(
                         "saved memory: retrieved context",
                         (
                             "Memory context. Do not reference unless the user asks "
                             f"about these topics.\n{ext_text}"
                         ),
-                    ))
+                    )))
                     for m in relevant:
                         self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
                         if m.get("id"):
@@ -272,7 +284,7 @@ class ChatProcessor:
                         )
                         if len(rag_content) > 10000:
                             rag_content = rag_content[:10000] + "\n[Truncated]"
-                        preface.append(untrusted_context_message("retrieved documents", rag_content))
+                        preface.append(_mark_cache_dynamic(untrusted_context_message("retrieved documents", rag_content)))
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
 
@@ -283,7 +295,7 @@ class ChatProcessor:
                 web_context, web_sources = comprehensive_web_search(
                     message, time_filter=time_filter, return_sources=True
                 )
-                preface.append(untrusted_context_message("web search results", web_context))
+                preface.append(_mark_cache_dynamic(untrusted_context_message("web search results", web_context)))
             except Exception as e:
                 logger.error(f"Web search failed: {e}")
                 preface.append({"role": "system", "content": "Web search encountered an error and could not retrieve results."})
@@ -302,10 +314,10 @@ class ChatProcessor:
                 result = fetch_webpage_content(url)
                 if result.get('success'):
                     content = result.get('content', '')[:10000]
-                    preface.append(untrusted_context_message(
+                    preface.append(_mark_cache_dynamic(untrusted_context_message(
                         f"web page: {url}",
                         f"Content from {url}:\n\n{content}",
-                    ))
+                    )))
 
         # Skills index — progressive disclosure. Only injected when the
         # model has the `manage_skills` tool available (agent_mode), and

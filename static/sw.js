@@ -10,7 +10,9 @@
 // v328: overhaul tool-result replay knobs in Agent settings (replay turns,
 //       0=all; replay budget as a % of usable context, replacing the fixed token
 //       budget; per-tool max-replay-chars head so replay restores >2k).
-const CACHE_NAME = 'odysseus-v328';
+// v329: add "Prompt-cache mode" toggle to Agent settings — preserves full context
+//       and restructures the prompt (stable prefix + dynamic tail) for KV reuse.
+const CACHE_NAME = 'odysseus-v329';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags

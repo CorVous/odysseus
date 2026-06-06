@@ -747,26 +747,46 @@ async def build_chat_context(
     # messages — bounded by a token budget, newest-first — so it continues from
     # what it did. Sliding-window over recent turns + summary-tier (older turns
     # stay as plain prose) is the mainstream pattern for context-limited models.
-    if agent_mode:
-        from src.settings import get_setting
-        # turns: 0 = unbounded (budget is the limiter). budget: a fraction of the
-        # usable input context (see _usable_input_context), so it scales with the
-        # model/window. pct <= 0 disables replay.
-        _replay_turns = int(get_setting("agent_tool_result_replay_turns", 2) or 0)
-        try:
-            _replay_pct = float(get_setting("agent_tool_result_replay_context_pct", 0.05) or 0.0)
-        except (TypeError, ValueError):
-            _replay_pct = 0.0
-        _replay_pct = max(0.0, min(_replay_pct, 1.0))
-        _usable = _usable_input_context(sess) if _replay_pct > 0 else 0
-        _replay_budget = int(_usable * _replay_pct)
-        _inject_recent_tool_results(messages, _replay_turns, _replay_budget)
+    from src.settings import get_setting
+    cache_mode = agent_mode and bool(get_setting("agent_prompt_cache_mode", False))
 
-    # Auto-compact
-    messages, context_length, was_compacted = await maybe_compact(
-        sess, sess.endpoint_url, sess.model, messages, sess.headers, owner=user,
-    )
-    messages = trim_for_context(messages, context_length)
+    if agent_mode:
+        if cache_mode:
+            # Prompt-cache mode: preserve the FULL turn history, deterministically.
+            # turns=0 (all) + an effectively-infinite budget makes the fold
+            # chronological-per-message and byte-stable across turns (each past
+            # message folds its own complete tool_events the same way every turn),
+            # so the prefix stays cacheable for llama.cpp/LM Studio KV reuse. The
+            # per-tool output is persisted uncapped in this mode (see agent_loop).
+            _inject_recent_tool_results(messages, 0, 1_000_000_000)
+        else:
+            # turns: 0 = unbounded (budget is the limiter). budget: a fraction of the
+            # usable input context (see _usable_input_context), so it scales with the
+            # model/window. pct <= 0 disables replay.
+            _replay_turns = int(get_setting("agent_tool_result_replay_turns", 2) or 0)
+            try:
+                _replay_pct = float(get_setting("agent_tool_result_replay_context_pct", 0.05) or 0.0)
+            except (TypeError, ValueError):
+                _replay_pct = 0.0
+            _replay_pct = max(0.0, min(_replay_pct, 1.0))
+            _usable = _usable_input_context(sess) if _replay_pct > 0 else 0
+            _replay_budget = int(_usable * _replay_pct)
+            _inject_recent_tool_results(messages, _replay_turns, _replay_budget)
+
+    if cache_mode:
+        # Skip compaction (summarizes → breaks fidelity) and the soft front-trim
+        # (shifts the prefix → breaks KV reuse). The only safety net is the
+        # window-ceiling trim in agent_loop, which fires solely at the real
+        # context limit. context_length is still needed for the % display.
+        from src.model_context import get_context_length
+        context_length = get_context_length(sess.endpoint_url, sess.model)
+        was_compacted = False
+    else:
+        # Auto-compact
+        messages, context_length, was_compacted = await maybe_compact(
+            sess, sess.endpoint_url, sess.model, messages, sess.headers, owner=user,
+        )
+        messages = trim_for_context(messages, context_length)
 
     return ChatContext(
         preface=preface,

@@ -132,6 +132,16 @@ DEFAULT_SETTINGS = {
     # cost of larger saved history; 0 = persist no extra head (replay falls back
     # to the ~2k display output). ≈4 chars/token, so 8000 ≈ 2k tokens/tool.
     "agent_tool_result_replay_max_chars": 8000,
+    # Prompt-cache / full-context mode (agent only). When ON, the agent prompt is
+    # restructured into a byte-stable prefix (static system block + append-only
+    # full-fidelity history) with all per-turn dynamic content (date, retrieved
+    # memories, RAG, web) moved to a tail before the user message — so a
+    # self-hosted llama.cpp/LM Studio backend can reuse the KV cache across turns.
+    # Preserves the FULL transcript (uncapped tool output; no compaction; trims
+    # only at the real context-window ceiling). OVERRIDES the three replay knobs
+    # above when on. Off by default: it grows context/storage and relocating
+    # memory/RAG below history can shift a weak model's behavior.
+    "agent_prompt_cache_mode": False,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell

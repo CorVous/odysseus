@@ -2214,6 +2214,11 @@
                 <label class="settings-label">Max replay output / tool (chars)</label>
                 <input id="set-agentReplayMaxChars" type="text" inputmode="numeric" placeholder="8000" class="settings-select" style="width:120px;">
               </div>
+              <div class="settings-row" style="align-items:center">
+                <label class="settings-label">Prompt-cache mode (preserve full context)</label>
+                <label class="admin-switch" style="flex-shrink:0" title="Restructure the agent prompt for KV-cache reuse and keep the full transcript. Overrides the replay knobs above."><input type="checkbox" id="set-agentCacheMode" /><span class="admin-slider"></span></label>
+              </div>
+              <span class="admin-toggle-sub" style="display:block;margin-top:2px;opacity:0.6">Keeps a byte-stable prefix + full-fidelity history so a self-hosted backend can reuse its KV cache. Preserves everything (uncapped); overrides the three replay knobs above. Grows context/storage.</span>
               <div id="set-agentMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
             </div>
           </div>
