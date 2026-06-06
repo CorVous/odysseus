@@ -1798,6 +1798,69 @@ def _build_actions_snapshot(tool_events: list, limit: int = 8000) -> str:
     return snap[:limit] if len(snap) > limit else snap
 
 
+def _select_tool_output_text(result: dict, is_doc_tool: bool, replay_max_chars: int):
+    """Return ``(display_text, replay_text)`` for one tool result.
+
+    ``display_text`` is the head shown in the tool bubble and saved as the
+    event's ``output`` (history reload, verifier snapshot). It keeps upstream's
+    ``_truncate`` policy — capped at ``MAX_OUTPUT_CHARS`` with a truncation note.
+    ``replay_text`` is a (potentially) larger head of the SAME underlying source,
+    persisted separately so cross-turn replay can restore far more than the
+    display head — bounded by ``replay_max_chars`` so a giant file read can't
+    bloat saved history. For the short summary branches (doc/session/success)
+    ``replay_text`` is returned empty to avoid duplicating data on disk."""
+    raw = ""          # untruncated source text (may be huge)
+    summary = ""      # set for branches that are already a short summary
+
+    if is_doc_tool and "action" in result:
+        action = result["action"]
+        title = result.get("title", "")
+        ver = result.get("version", "?")
+        if action == "create":
+            summary = f'Document created: "{title}" (v{ver})'
+        elif action == "edit":
+            summary = f'Document edited: "{title}" (v{ver}, {result.get("applied", 0)} edit(s))'
+        elif action == "update":
+            summary = f'Document updated: "{title}" (v{ver})'
+    elif "stdout" in result:
+        # On a bash/python timeout the result carries error + (often empty)
+        # stdout/stderr; fall back to the error so the "timed out" reason reaches
+        # the UI instead of a blank result.
+        raw = result["stdout"] or result["stderr"] or result.get("error", "")
+    elif "output" in result:
+        # bash / python canonical result: {"output": ..., "exit_code": ...}
+        raw = result["output"] or ""
+    elif "response" in result:
+        # AI interaction tools (chat_with_model, send_to_session)
+        label = result.get("model", result.get("session_name", "AI"))
+        raw = f"{label}: {result['response']}"
+    elif "content" in result:
+        raw = result["content"] or ""
+    elif "results" in result:
+        raw = result["results"] or ""
+    elif "session_id" in result and "name" in result:
+        summary = f"Session created: {result['name']} (id: {result['session_id']})"
+    elif "success" in result:
+        summary = (
+            f"Written: {result.get('path', '')}"
+            if result["success"]
+            else f"Error: {result.get('error', '')}"
+        )
+    elif "error" in result:
+        raw = result["error"] or ""
+
+    if summary:
+        return summary, ""
+    # Display head keeps upstream's MAX_OUTPUT_CHARS cap + truncation note.
+    display_text = _truncate(raw)
+    # Carry a separate, larger replay head only when it actually adds content
+    # beyond what the display head already holds (and replay is enabled).
+    replay_text = ""
+    if replay_max_chars > len(display_text) and len(raw) > len(display_text):
+        replay_text = raw[:replay_max_chars]
+    return display_text, replay_text
+
+
 async def _run_verifier_subagent(
     instruction: str, actions_snapshot: str,
     *, endpoint_url: str, model: str, headers: dict,
@@ -2432,6 +2495,15 @@ async def stream_agent_loop(
     time_to_first_token = None
     first_token_received = False
     tool_events = []   # Persist tool executions for history reload
+    # Per-tool cap (chars) for the LARGER output head persisted for cross-turn
+    # replay — distinct from the ~2k display head. Read once per turn; 0 disables
+    # the extra head (replay then falls back to the display output).
+    try:
+        _replay_persist_chars = int(get_setting("agent_tool_result_replay_max_chars", 8000) or 0)
+    except (TypeError, ValueError):
+        _replay_persist_chars = 8000
+    if _replay_persist_chars < 0:
+        _replay_persist_chars = 0
     round_texts = []   # Cleaned text per round for history reload
     # Completion-verifier state (mechanism 3a). _effectful_used flips on when
     # a tool that produces a checkable artifact runs; the verifier only fires
@@ -3245,47 +3317,12 @@ async def stream_agent_loop(
                     f'data: {json.dumps({"type": "plan_update", "data": result["plan_update"]})}\n\n'
                 )
 
-            # Build output for frontend tool bubble.
-            # Document tools get a short summary — content goes to the editor panel.
-            output_text = ""
-            if is_doc_tool and "action" in result:
-                action = result["action"]
-                title = result.get("title", "")
-                ver = result.get("version", "?")
-                if action == "create":
-                    output_text = f'Document created: "{title}" (v{ver})'
-                elif action == "edit":
-                    output_text = f'Document edited: "{title}" (v{ver}, {result.get("applied", 0)} edit(s))'
-                elif action == "update":
-                    output_text = f'Document updated: "{title}" (v{ver})'
-            elif "stdout" in result:
-                # On a bash/python timeout the result carries error + (often
-                # empty) stdout/stderr; fall back to the error so the "timed
-                # out" reason reaches the UI instead of a blank result.
-                raw = result["stdout"] or result["stderr"] or result.get("error", "")
-                output_text = _truncate(raw)
-            elif "output" in result:
-                # bash / python canonical result: {"output": ..., "exit_code": ...}
-                raw = result["output"] or ""
-                output_text = _truncate(raw)
-            elif "response" in result:
-                # AI interaction tools (chat_with_model, send_to_session)
-                label = result.get("model", result.get("session_name", "AI"))
-                output_text = _truncate(f"{label}: {result['response']}")
-            elif "content" in result:
-                output_text = _truncate(result["content"])
-            elif "results" in result:
-                output_text = _truncate(result["results"])
-            elif "session_id" in result and "name" in result:
-                output_text = f"Session created: {result['name']} (id: {result['session_id']})"
-            elif "success" in result:
-                output_text = (
-                    f"Written: {result.get('path', '')}"
-                    if result["success"]
-                    else f"Error: {result.get('error', '')}"
-                )
-            elif "error" in result:
-                output_text = _truncate(result["error"])
+            # Build output for frontend tool bubble (short display head) plus a
+            # larger head persisted only for cross-turn replay. Document tools get
+            # a short summary — content goes to the editor panel.
+            output_text, replay_output = _select_tool_output_text(
+                result, is_doc_tool, _replay_persist_chars
+            )
 
             # Emit tool_output (include ui_event data if present)
             tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code")}
@@ -3365,6 +3402,11 @@ async def stream_agent_loop(
                 "output": output_text,
                 "exit_code": result.get("exit_code"),
             }
+            # Larger output head for cross-turn replay (only when it adds content
+            # beyond the display head). Lets a follow-up turn re-read far more than
+            # the ~2k bubble. See routes/chat_helpers._format_tool_recap.
+            if replay_output:
+                tool_event["replay_output"] = replay_output
             if result.get("image_url"):
                 for ik in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
                     if result.get(ik):

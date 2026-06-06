@@ -655,6 +655,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         _INT_RANGES = {
             "agent_max_rounds": (1, 200),
             "agent_max_tool_calls": (0, 1000),  # 0 = unlimited
+            "agent_tool_result_replay_turns": (0, 200),  # 0 = unbounded
+            "agent_tool_result_replay_max_chars": (0, 200000),  # per-tool replay head
+        }
+        _FLOAT_RANGES = {
+            # Fraction of usable input context spent on tool-result replay.
+            # 0 disables replay.
+            "agent_tool_result_replay_context_pct": (0.0, 1.0),
         }
         for key in DEFAULT_SETTINGS:
             if key not in body:
@@ -666,6 +673,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                     val = int(val)
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"{key} must be an integer")
+                val = max(lo, min(val, hi))
+            elif key in _FLOAT_RANGES:
+                lo, hi = _FLOAT_RANGES[key]
+                try:
+                    val = float(val)
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key} must be a number")
                 val = max(lo, min(val, hi))
             current[key] = val
         _save_settings(current)

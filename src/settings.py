@@ -130,12 +130,24 @@ DEFAULT_SETTINGS = {
     # Cross-turn tool-result replay: fold the saved tool_events (commands +
     # output heads) from the most recent N assistant turns back into the agent's
     # context on a follow-up, so it sees what it already ran instead of redoing
-    # it. Bounded by a token budget (newest turns first); older turns stay as
-    # plain prose. 0 turns disables. Tuned small by default — a weak/local model
-    # loses coherence as context grows, so this is a sliding window, not full
-    # replay. See routes/chat_helpers._inject_recent_tool_results.
+    # it. Newest turns first; older turns stay as plain prose. `replay_turns` is
+    # the turn window — 0 means UNBOUNDED (replay as far back as the budget
+    # allows). The budget is `replay_context_pct`: a fraction of the *usable
+    # input context* (the effective agent_input_token_budget actually sent this
+    # turn), so it scales with the model/window instead of being a fixed token
+    # count. Setting the pct to 0 disables replay entirely. Tuned small by
+    # default — a weak/local model loses coherence as context grows, so this is a
+    # sliding window, not full replay. See
+    # routes/chat_helpers._inject_recent_tool_results.
     "agent_tool_result_replay_turns": 2,
-    "agent_tool_result_replay_token_budget": 6000,
+    "agent_tool_result_replay_context_pct": 0.05,
+    # Per-tool cap (characters) on the LARGER output head persisted for replay,
+    # separate from the ~2k display head shown in the tool bubble. This is the
+    # ceiling on how much of any single tool result a follow-up turn can re-read;
+    # the total is still bounded by replay_context_pct. Raise toward "full" at the
+    # cost of larger saved history; 0 = persist no extra head (replay falls back
+    # to the ~2k display output). ≈4 chars/token, so 8000 ≈ 2k tokens/tool.
+    "agent_tool_result_replay_max_chars": 8000,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
