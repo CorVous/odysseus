@@ -1673,6 +1673,15 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     elif is_dalle and size not in valid_dalle3_sizes:
         size = "1024x1024"
 
+    # OpenRouter (and other chat-completions-only gateways) do not implement the
+    # OpenAI /images/generations route. They generate images through the chat
+    # completions API with modalities=["image","text"] and return the image as a
+    # base64 data: URL in choices[0].message.images[]. Branch to that path.
+    if "openrouter.ai" in base_url.lower():
+        return await _generate_image_via_chat(
+            base_url, model_id, headers, prompt, size, quality, session_id, owner,
+        )
+
     payload = {
         "model": model_id,
         "prompt": prompt,
@@ -1777,6 +1786,110 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
 
     except httpx.TimeoutException:
         return {"error": "Image generation timed out (300s). The model may be overloaded — try again or use quality=low."}
+    except Exception as e:
+        return {"error": f"Image generation error: {str(e)}"}
+
+
+async def _generate_image_via_chat(base_url: str, model_id: str, headers: Dict,
+                                   prompt: str, size: str, quality: str,
+                                   session_id: Optional[str] = None,
+                                   owner: Optional[str] = None) -> Dict:
+    """Generate an image via the chat-completions API with image modalities.
+
+    OpenRouter (and similar gateways) don't expose /images/generations; an image
+    model is invoked like a normal chat completion with modalities=["image",
+    "text"], and the result comes back as a base64 data: URL inside
+    choices[0].message.images[]. We decode that and persist it exactly like the
+    /images/generations path so the return shape is identical.
+    """
+    import base64
+    import httpx
+    from pathlib import Path
+
+    chat_url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"],
+    }
+    logger.info(f"Image generation (chat modalities): model={model_id}, size={size}, prompt={prompt[:80]}")
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)) as client:
+            resp = await client.post(chat_url, json=payload, headers=headers)
+
+        if resp.status_code != 200:
+            error_text = resp.text[:500]
+            try:
+                ej = resp.json().get("error")
+                error_text = ej.get("message", error_text) if isinstance(ej, dict) else (str(ej) or error_text)
+            except Exception:
+                pass
+            return {"error": f"Image generation failed ({resp.status_code}): {error_text}"}
+
+        data = resp.json()
+
+        # Extract the first image data-URL from the assistant message.
+        data_url = None
+        try:
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            imgs = msg.get("images") or []
+            if imgs:
+                iu = imgs[0].get("image_url")
+                data_url = iu.get("url") if isinstance(iu, dict) else iu
+        except Exception:
+            data_url = None
+
+        if not data_url:
+            return {"error": "No image returned — the model may not support image output, "
+                             "or the model id is not an image model."}
+
+        # data_url is typically "data:image/png;base64,<...>"
+        b64 = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            return {"error": "Image API returned an unparseable image payload."}
+
+        img_dir = Path("data/generated_images")
+        img_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex[:12]}.png"
+        (img_dir / filename).write_bytes(raw)
+        image_url = f"/api/generated-image/{filename}"
+
+        image_id = ""
+        try:
+            from src.database import SessionLocal as _GallerySL, GalleryImage
+            image_id = str(uuid.uuid4())
+            _gdb = _GallerySL()
+            _gdb.add(GalleryImage(
+                id=image_id,
+                filename=filename,
+                prompt=prompt,
+                model=model_id,
+                size=size,
+                quality=quality,
+                session_id=session_id,
+                owner=owner,
+            ))
+            _gdb.commit()
+            _gdb.close()
+        except Exception as _ge:
+            logger.warning(f"Failed to save gallery record: {_ge}")
+            image_id = ""
+
+        return {
+            "results": f"Generated image for: {prompt[:100]}",
+            "image_url": image_url,
+            "image_id": image_id,
+            "image_prompt": prompt,
+            "image_model": model_id,
+            "image_size": size,
+            "image_quality": quality,
+        }
+
+    except httpx.TimeoutException:
+        return {"error": "Image generation timed out (300s). The model may be overloaded — try again."}
     except Exception as e:
         return {"error": f"Image generation error: {str(e)}"}
 

@@ -55,116 +55,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text="Error: Image prompt is required")]
 
     try:
-        import httpx
-        from src.settings import load_settings, get_setting
-        from src.ai_interaction import _resolve_model
+        from src.settings import get_setting
+        from src.ai_interaction import do_generate_image
 
         if not get_setting("image_gen_enabled", True):
             return [TextContent(type="text", text="Error: Image generation is disabled by the administrator.")]
 
-        _settings = load_settings()
+        # Delegate to the single shared implementation in ai_interaction, which
+        # handles model auto-detect, OpenAI /images/generations AND the OpenRouter
+        # chat-completions-with-modalities path, plus gallery persistence. The
+        # content format is newline-delimited: prompt, model, size, quality.
+        content = "\n".join([prompt, model_spec, size, quality])
+        res = await do_generate_image(content)
 
-        if not model_spec:
-            model_spec = _settings.get("image_model", "")
-        if quality == "medium" and _settings.get("image_quality"):
-            quality = _settings["image_quality"]
+        if not isinstance(res, dict) or res.get("error"):
+            err = (res or {}).get("error", "unknown error") if isinstance(res, dict) else "unknown error"
+            return [TextContent(type="text", text=f"Error: {err}")]
 
-        # Auto-detect best available image model
-        if not model_spec:
-            for candidate in ("gpt-image-1.5", "gpt-image-1", "dall-e-3"):
-                try:
-                    _resolve_model(candidate)
-                    model_spec = candidate
-                    break
-                except ValueError:
-                    continue
-            if not model_spec:
-                return [TextContent(type="text", text="Error: No image model found. Configure one in Admin.")]
+        result = (
+            f"Generated image for: {str(res.get('image_prompt', prompt))[:100]}\n"
+            f"image_url: {res.get('image_url')}\n"
+            f"model: {res.get('image_model')}\n"
+            f"size: {res.get('image_size')}"
+        )
+        return [TextContent(type="text", text=result)]
 
-        url, model_id, headers = _resolve_model(model_spec)
-
-        is_gpt_image = "gpt-image" in model_id.lower()
-        base_url = url.replace("/chat/completions", "").replace("/v1/messages", "").rstrip("/")
-        images_url = base_url + "/images/generations"
-
-        valid_gpt_sizes = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-        valid_dalle3_sizes = {"1024x1024", "1024x1792", "1792x1024"}
-        if is_gpt_image and size not in valid_gpt_sizes:
-            size = "1024x1024"
-        elif not is_gpt_image and size not in valid_dalle3_sizes:
-            size = "1024x1024"
-
-        payload = {"model": model_id, "prompt": prompt, "n": 1, "size": size}
-        if is_gpt_image:
-            payload["quality"] = quality if quality in ("low", "medium", "high", "auto") else "medium"
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)) as client:
-            resp = await client.post(images_url, json=payload, headers=headers)
-
-            if resp.status_code != 200:
-                error_text = resp.text[:500]
-                try:
-                    err_json = resp.json()
-                    error_text = err_json.get("error", {}).get("message", error_text) if isinstance(err_json.get("error"), dict) else str(err_json.get("error", error_text))
-                except Exception:
-                    pass
-                return [TextContent(type="text", text=f"Error: Image generation failed ({resp.status_code}): {error_text}")]
-
-            data = resp.json()
-            images = data.get("data", [])
-            if not images:
-                return [TextContent(type="text", text="Error: No images returned from API")]
-
-            img = images[0]
-            image_url = None
-            # Prefix the instance's public base URL (existing app_public_url setting) so the
-            # link is fully-qualified and clickable when the model echoes it. Empty = relative
-            # same-origin path (unchanged default).
-            _pub_base = (get_setting("app_public_url", "") or "").rstrip("/")
-
-            if img.get("b64_json"):
-                img_dir = Path(GENERATED_IMAGES_DIR)
-                img_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"{uuid.uuid4().hex[:12]}.png"
-                img_path = img_dir / filename
-                img_path.write_bytes(base64.b64decode(img["b64_json"]))
-                image_url = f"{_pub_base}/api/generated-image/{filename}"
-
-                # Save to gallery
-                try:
-                    from src.database import SessionLocal, GalleryImage
-                    db = SessionLocal()
-                    db.add(GalleryImage(
-                        id=str(uuid.uuid4()),
-                        filename=filename,
-                        prompt=prompt,
-                        model=model_id,
-                        size=size,
-                        quality=payload.get("quality", "medium"),
-                    ))
-                    db.commit()
-                    db.close()
-                except Exception:
-                    pass
-
-            elif img.get("url"):
-                image_url = img["url"]
-            else:
-                return [TextContent(type="text", text="Error: Unexpected image API response format")]
-
-            # "Direct link:" rather than an "image_url:" label — small models copied the
-            # label token ("image_url") into the link href, producing a broken link.
-            result = (
-                f"Generated image for: {prompt[:100]}\n"
-                f"Direct link: {image_url}\n"
-                f"model: {model_id}\nsize: {size}"
-            )
-            return [TextContent(type="text", text=result)]
-
-    except httpx.TimeoutException:
-        return [TextContent(type="text", text="Error: Image generation timed out (300s)")]
-    except ValueError as e:
-        return [TextContent(type="text", text=f"Error: {e}")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {e}")]
 
