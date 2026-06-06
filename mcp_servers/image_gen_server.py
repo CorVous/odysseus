@@ -5,9 +5,7 @@ MCP server exposing image generation via OpenAI-compatible APIs.
 """
 
 import asyncio
-import base64
 import sys
-import uuid
 from pathlib import Path
 
 from mcp.server import Server
