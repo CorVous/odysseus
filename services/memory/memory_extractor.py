@@ -284,9 +284,31 @@ async def extract_and_store(
 
         fallback_facts = _fallback_memory_candidates(stripped_recent)
 
+        # Flatten the window into a SINGLE user message instead of appending the
+        # raw alternating role messages. Passing the history as role messages
+        # makes the prompt END on an assistant turn whenever the window's last
+        # message is an assistant reply — and a chat model then returns an EMPTY
+        # completion (nothing to answer), which is the real reason auto-memory
+        # can produce nothing ("0 candidates" on every run with a reasoning model).
+        # Ending on a user instruction guarantees a response. The skill extractor
+        # flattens for the same reason.
+        def _flatten_msg(m):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(
+                    b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            return f"{m.get('role', '?')}: {c}"
+
+        transcript = "\n\n".join(_flatten_msg(m) for m in stripped_recent)
         extraction_messages = [
             {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-        ] + stripped_recent
+            {"role": "user", "content": (
+                "Conversation to analyze:\n\n" + transcript
+                + "\n\nReturn the JSON array of durable facts now (or [] if none)."
+            )},
+        ]
 
         facts = []
         try:
@@ -295,19 +317,41 @@ async def extract_and_store(
                 model,
                 extraction_messages,
                 temperature=0.1,
-                max_tokens=500,
+                # A reasoning model spends most of its budget on <think> tokens
+                # BEFORE emitting the JSON, so the old 500 truncated the response
+                # before any JSON appeared → every run logged "0 candidates". The
+                # audit path hit the same wall and raised to 16384; extraction's
+                # output (a short facts list) is small, so an ample ceiling is
+                # enough once thinking has room.
+                max_tokens=4096,
                 headers=headers,
             )
 
-            # Parse JSON from response (handle markdown fences if model wraps them)
-            text = raw.strip()
+            # Parse JSON, tolerating reasoning-model noise. The model emits
+            # <think>…</think> (and sometimes a prose preamble) BEFORE the JSON
+            # array; without stripping it, json.loads bombs on char 0 and the run
+            # silently yields "0 candidates" (the skill extractor and the audit
+            # path already strip_think; this one didn't).
+            text = (raw or "").strip()
+            try:
+                from src.text_helpers import strip_think as _strip_think
+                text = _strip_think(text, prose=True, prompt_echo=True).strip()
+            except Exception:
+                pass
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            # JSON may still be embedded in surrounding commentary — slice from
+            # the first '[' to the last ']' (extraction returns a list).
+            if text and text[0] != "[":
+                _start = text.find("[")
+                _end = text.rfind("]")
+                if 0 <= _start < _end:
+                    text = text[_start : _end + 1]
 
             try:
                 facts = json.loads(text)
             except json.JSONDecodeError:
-                logger.debug("Memory extraction returned non-JSON")
+                logger.debug("Memory extraction returned non-JSON: %r", (raw or "")[:120])
         except Exception as e:
             logger.warning(f"LLM memory extraction failed; using fallback candidates if available: {e}")
 
