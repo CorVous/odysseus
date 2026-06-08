@@ -236,6 +236,43 @@ def _is_text_duplicate(new_text: str, existing: list, threshold: float = 0.6) ->
     return False
 
 
+def _parse_extraction_json(raw: str) -> list:
+    """Parse the extraction LLM's reply into a list of facts, tolerating
+    reasoning-model noise.
+
+    The model emits <think>…</think> (and sometimes a prose preamble or a
+    ```json fence) AROUND the JSON array; without stripping it, json.loads
+    bombs and the run silently yields "0 candidates". Pure str -> list (no
+    LLM/network); returns [] on any parse failure instead of raising.
+    """
+    text = (raw or "").strip()
+    try:
+        from src.text_helpers import strip_think as _strip_think
+        text = _strip_think(text, prose=True, prompt_echo=True).strip()
+    except Exception:
+        pass
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    # JSON may still be embedded in surrounding commentary (leading prose or
+    # trailing remarks like "[...] Done!") — slice from the first '[' to the
+    # last ']' whenever both exist. Slice unconditionally: a reply that starts
+    # with '[' can still carry trailing commentary that breaks json.loads.
+    _start = text.find("[")
+    _end = text.rfind("]")
+    if 0 <= _start < _end:
+        text = text[_start : _end + 1]
+
+    try:
+        facts = json.loads(text)
+    except json.JSONDecodeError:
+        logger.debug("Memory extraction returned non-JSON: %r", (raw or "")[:120])
+        return []
+    except Exception:
+        logger.debug("Memory extraction returned non-JSON: %r", (raw or "")[:120])
+        return []
+    return facts if isinstance(facts, list) else []
+
+
 async def extract_and_store(
     session,
     memory_manager,
@@ -330,33 +367,10 @@ async def extract_and_store(
                 headers=headers,
             )
 
-            # Parse JSON, tolerating reasoning-model noise. The model emits
-            # <think>…</think> (and sometimes a prose preamble) BEFORE the JSON
-            # array; without stripping it, json.loads bombs on char 0 and the run
-            # silently yields "0 candidates" (the skill extractor and the audit
-            # path already strip_think; this one didn't).
-            text = (raw or "").strip()
-            try:
-                from src.text_helpers import strip_think as _strip_think
-                text = _strip_think(text, prose=True, prompt_echo=True).strip()
-            except Exception:
-                pass
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            # JSON may still be embedded in surrounding commentary — slice from
-            # the first '[' to the last ']' (extraction returns a list). Leading
-            # whitespace and <think>/prose blocks were already stripped above, so
-            # this only handles trailing/leading commentary the model left in place.
-            if text and text[0] != "[":
-                _start = text.find("[")
-                _end = text.rfind("]")
-                if 0 <= _start < _end:
-                    text = text[_start : _end + 1]
-
-            try:
-                facts = json.loads(text)
-            except json.JSONDecodeError:
-                logger.debug("Memory extraction returned non-JSON: %r", (raw or "")[:120])
+            # Parse JSON, tolerating reasoning-model noise (<think> blocks, a
+            # ```json fence, and leading/trailing commentary). See
+            # _parse_extraction_json — returns [] rather than raising.
+            facts = _parse_extraction_json(raw)
         except Exception as e:
             logger.warning(f"LLM memory extraction failed; using fallback candidates if available: {e}")
 
