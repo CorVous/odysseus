@@ -127,6 +127,10 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # Client-side chat response timeout in seconds. The fetch aborts after this
+    # duration of no response. Default is 120s (matching the former hardcoded
+    # DEFAULT_TIMEOUT_MS). Set to 0 for unlimited. Bounded to [10, 86400].
+    "chat_stream_timeout_seconds": 120,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell

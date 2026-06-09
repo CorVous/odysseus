@@ -1615,6 +1615,38 @@ async function initResearchSettings() {
   });
 }
 
+/* ── Chat Stream Timeout (Agent card) ── */
+async function initChatTimeoutSettings() {
+  var timeoutInput = el('set-chatStreamTimeout');
+  var msg = null;
+
+  try {
+    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    var settings = await res.json();
+    if (settings.chat_stream_timeout_seconds !== undefined && settings.chat_stream_timeout_seconds !== null) {
+      timeoutInput.value = settings.chat_stream_timeout_seconds;
+    }
+  } catch (e) { console.warn('Failed to load chat stream timeout', e); }
+
+  async function saveChatTimeout() {
+    var val = parseInt(timeoutInput.value, 10);
+    if (!isNaN(val) && val >= 10) {
+      try {
+        await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_stream_timeout_seconds: val })
+        });
+        if (msg) { msg.textContent = 'Saved'; setTimeout(function(){ if(msg) msg.textContent=''; }, 2000); }
+      } catch (e) { if(msg){ msg.textContent = 'Failed to save'; } }
+    } else if (timeoutInput.value !== '') {
+      timeoutInput.value = '';
+      if (msg) { msg.textContent = 'Min 10 seconds'; setTimeout(function(){ msg.textContent=''; }, 2000); }
+    }
+  }
+
+  timeoutInput.addEventListener('change', saveChatTimeout);
+}
+
 /* ── Deep Research Search (Search tab) ── */
 async function initResearchSearchSettings() {
   var searchSel = el('set-researchSearch');
@@ -2350,6 +2382,7 @@ function initAll() {
   initResearchSettings();
   initResearchSearchSettings();
   initAgentSettings();
+  initChatTimeoutSettings();
   initAppearance();
   initShortcuts();
   initAccount();
