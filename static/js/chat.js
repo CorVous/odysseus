@@ -29,6 +29,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   const DEFAULT_TIMEOUT_MS = 120000;
   const RESEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>';
 
+  let _chatSettings = null;
+  fetch('/api/auth/settings', { credentials: 'same-origin' })
+    .then(r => r.json()).then(s => { _chatSettings = s; }).catch(() => {});
+
   let API_BASE = '';
   let currentAbort = null;
   let isStreaming = false;
@@ -831,8 +835,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       const _tState = Storage.loadToggleState();
       const _isAgent = (_tState.mode || 'chat') === 'agent';
 
-      // Timeout: 6 min for research and agent mode, 3 min otherwise
-      const timeoutMs = el('research-toggle').checked || _isAgent ? RESEARCH_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+      // Timeout: 6 min for research and agent mode, configurable for normal chat
+      let chatTimeoutSec = 120;
+      if (_chatSettings && _chatSettings.chat_stream_timeout_seconds) {
+        const parsed = parseInt(_chatSettings.chat_stream_timeout_seconds, 10);
+        if (!isNaN(parsed) && parsed >= 10) chatTimeoutSec = parsed;
+      }
+      const timeoutMs = el('research-toggle').checked || _isAgent ? RESEARCH_TIMEOUT_MS : chatTimeoutSec * 1000;
       timeoutId = setTimeout(() => {
         if (!abortCtrl.signal.aborted) {
           timedOut = true;
