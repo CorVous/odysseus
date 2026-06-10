@@ -1241,3 +1241,20 @@ function _safeSourceHref(raw) {
   } catch {}
   return '';
 }
+
+// Swipe-dismiss (ui.js) hides the modal without calling closePanel(), leaving
+// _open=true. The next button-tap then calls closePanel() (toggle-off) instead
+// of openPanel() — the user must tap twice to reopen. Fix: reset state and
+// remove the hidden overlay element on swipe-dismiss.
+window.addEventListener('modal-dismissed', (e) => {
+  if (e.detail?.id !== 'research-overlay') return;
+  if (!_open) return;
+  _open = false;
+  if (_onDocKeydown) {
+    document.removeEventListener('keydown', _onDocKeydown);
+    _onDocKeydown = null;
+  }
+  document.body.classList.remove('research-panel-view');
+  const stale = document.getElementById('research-overlay');
+  if (stale) stale.remove();
+});
