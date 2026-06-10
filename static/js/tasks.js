@@ -2745,6 +2745,26 @@ function stopNotificationPolling() {
 // Start polling on module load
 startNotificationPolling();
 
+// Swipe-dismiss (ui.js) hides the modal without calling closeTasks(), leaving
+// _open=true. The next button-tap then calls closeTasks() (toggle-off) instead
+// of openTasks() — the user must tap twice to reopen. Fix: listen for the
+// modal-dismissed event dispatched by ui.js on swipe, reset _open, and remove
+// the hidden modal element so openTasks() gets a clean DOM on re-open.
+window.addEventListener('modal-dismissed', (e) => {
+  if (e.detail?.id !== 'tasks-modal') return;
+  if (!_open) return;
+  _open = false;
+  if (_clockInterval) { clearInterval(_clockInterval); _clockInterval = null; }
+  if (_escHandler) { document.removeEventListener('keydown', _escHandler); _escHandler = null; }
+  if (window._tasksFormEsc) {
+    document.removeEventListener('keydown', window._tasksFormEsc, true);
+    window._tasksFormEsc = null;
+  }
+  // Remove the hidden-but-still-in-DOM modal so openTasks() creates a fresh one.
+  const stale = document.getElementById('tasks-modal');
+  if (stale) stale.remove();
+});
+
 const tasksModule = { openTasks, closeTasks, isTasksOpen, startNotificationPolling, stopNotificationPolling };
 export default tasksModule;
 window.tasksModule = tasksModule;

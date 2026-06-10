@@ -2826,6 +2826,28 @@ function _humanSize(bytes) {
   return `${size.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
+// Swipe-dismiss (ui.js) hides the modal without calling closeGallery(), leaving
+// _open=true. The next button-tap then calls closeGallery() (toggle-off) instead
+// of openGallery() — the user must tap twice to reopen. Fix: listen for the
+// modal-dismissed event dispatched by ui.js on swipe, reset _open, and remove
+// the hidden modal element so openGallery() creates a fresh one on re-open.
+window.addEventListener('modal-dismissed', (e) => {
+  if (e.detail?.id !== 'gallery-modal') return;
+  if (!_open) return;
+  _open = false;
+  if (_galleryResizeHandler) {
+    window.removeEventListener('resize', _galleryResizeHandler);
+    _galleryResizeHandler = null;
+  }
+  if (_escHandler) {
+    document.removeEventListener('keydown', _escHandler, true);
+    _escHandler = null;
+  }
+  // Remove the hidden-but-still-in-DOM modal so openGallery() creates a fresh one.
+  const stale = document.getElementById('gallery-modal');
+  if (stale) stale.remove();
+});
+
 const galleryModule = {
   openGallery,
   closeGallery,
